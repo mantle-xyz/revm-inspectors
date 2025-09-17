@@ -416,6 +416,7 @@ impl CallTraceNode {
                     topics: Some(log.raw_log.topics().to_vec()),
                     data: Some(log.raw_log.data.clone()),
                     position: Some(log.position),
+                    ..Default::default()
                 })
                 .collect();
         }
@@ -657,7 +658,7 @@ impl CallTraceStep {
             error: self.as_error(),
             gas: self.gas_remaining,
             gas_cost: self.gas_cost,
-            op: self.op.to_string(),
+            op: self.op.to_string().into(),
             pc: self.pc as u64,
             refund_counter: (self.gas_refund_counter > 0).then_some(self.gas_refund_counter),
             // Filled, if not disabled manually
