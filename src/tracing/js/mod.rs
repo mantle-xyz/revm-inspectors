@@ -21,6 +21,7 @@ pub use boa_engine::vm::RuntimeLimits;
 use boa_engine::{js_string, Context, JsError, JsObject, JsResult, JsValue, Source};
 use core::borrow::Borrow;
 use revm::{
+    bytecode::OpCode,
     context::JournalTr,
     context_interface::{
         result::{ExecutionResult, HaltReasonTr, Output, ResultAndState},
@@ -30,7 +31,7 @@ use revm::{
     interpreter::{
         interpreter_types::{Jumps, LoopControl},
         CallInputs, CallOutcome, CallScheme, CreateInputs, CreateOutcome, Gas, InstructionResult,
-        Interpreter, InterpreterResult,
+        Interpreter, InterpreterAction, InterpreterResult,
     },
     DatabaseRef, Inspector,
 };
@@ -85,6 +86,10 @@ pub struct JsInspector {
     call_stack: Vec<CallStackItem>,
     /// Marker to track whether the precompiles have been registered.
     precompiles_registered: bool,
+    /// Tracker for PC recorded in start_step
+    last_start_step_pc: Option<usize>,
+    /// Tracks gas spent in the previous step to calculate individual opcode cost
+    previous_gas_spent: u64,
 }
 
 impl JsInspector {
@@ -190,6 +195,8 @@ impl JsInspector {
             step_fn,
             call_stack: Default::default(),
             precompiles_registered: false,
+            last_start_step_pc: None,
+            previous_gas_spent: 0,
         })
     }
 
@@ -213,6 +220,16 @@ impl JsInspector {
     /// By default
     pub fn set_runtime_limits(&mut self, limits: RuntimeLimits) {
         self.ctx.set_runtime_limits(limits);
+    }
+
+    /// Calculate op cost based on previous gas spent and new spent value
+    fn get_op_cost(&self, spent: u64) -> u64 {
+        spent.saturating_sub(self.previous_gas_spent)
+    }
+
+    /// Set the new previous gas spent value
+    fn set_previous_gas_spent(&mut self, spent: u64) {
+        self.previous_gas_spent = spent;
     }
 
     /// Calls the result function and returns the result as [serde_json::Value].
@@ -292,7 +309,7 @@ impl JsInspector {
                 .try_into()
                 .unwrap_or(u64::MAX),
             value: tx.value(),
-            block: block.number(),
+            block: block.number().try_into().unwrap_or(u64::MAX),
             coinbase: block.beneficiary(),
             output: output_bytes.unwrap_or_default(),
             time: block.timestamp().to_string(),
@@ -393,7 +410,7 @@ impl JsInspector {
 
     /// Registers the precompiles in the JS context
     fn register_precompiles<CTX: ContextTr<Journal: JournalExt>>(&mut self, context: &mut CTX) {
-        if !self.precompiles_registered {
+        if self.precompiles_registered {
             return;
         }
         let precompiles = PrecompileList(context.journal().precompile_addresses().clone());
@@ -409,6 +426,10 @@ where
     CTX: ContextTr<Journal: JournalExt, Db: DatabaseRef>,
 {
     fn step(&mut self, interp: &mut Interpreter, context: &mut CTX) {
+        // if this is a revert we need to manually record this so that we can use it in the
+        // step_end fn
+        self.last_start_step_pc = Some(interp.bytecode.pc());
+
         if self.step_fn.is_none() {
             return;
         }
@@ -419,15 +440,17 @@ where
         let evm_memory = interp.memory.borrow();
         let (memory, _memory_guard) = MemoryRef::new(evm_memory);
         let active_call = self.active_call();
+
+        let gas_spent = interp.gas.spent();
         let step = StepLog {
             stack,
             op: interp.bytecode.opcode().into(),
             memory,
             pc: interp.bytecode.pc() as u64,
-            gas_remaining: interp.control.gas().remaining(),
-            cost: interp.control.gas().spent(),
+            gas_remaining: interp.gas.remaining(),
+            cost: self.get_op_cost(gas_spent),
             depth: context.journal_ref().depth() as u64,
-            refund: interp.control.gas().refunded() as u64,
+            refund: interp.gas.refunded() as u64,
             error: None,
             contract: Contract {
                 caller: interp.input.caller_address,
@@ -437,8 +460,12 @@ where
             },
         };
 
+        self.set_previous_gas_spent(gas_spent);
+
         if self.try_step(step, db).is_err() {
-            interp.control.set_instruction_result(InstructionResult::Revert);
+            interp
+                .bytecode
+                .set_action(InterpreterAction::new_halt(InstructionResult::Revert, interp.gas));
         }
     }
 
@@ -447,7 +474,12 @@ where
             return;
         }
 
-        if interp.control.instruction_result().is_revert() {
+        if interp
+            .bytecode
+            .action()
+            .as_ref()
+            .is_some_and(|a| a.instruction_result().map(|r| r.is_revert()).unwrap_or(false))
+        {
             let (db, _db_guard) =
                 EvmDbRef::new(context.journal_ref().evm_state(), context.db_ref());
 
@@ -455,16 +487,24 @@ where
             let mem = interp.memory.borrow();
             let (memory, _memory_guard) = MemoryRef::new(mem);
             let active_call = self.active_call();
+            let gas_spent = interp.gas.spent();
+
             let step = StepLog {
                 stack,
-                op: interp.bytecode.opcode().into(),
+                // we can use REVERT opcode here because we checked that this was a revert
+                op: OpCode::REVERT.get().into(),
+                // Use the recorded pc of the current step for the revert here
+                pc: self.last_start_step_pc.unwrap_or_default() as u64,
                 memory,
-                pc: interp.bytecode.pc() as u64,
-                gas_remaining: interp.control.gas().remaining(),
-                cost: interp.control.gas().spent(),
+                gas_remaining: interp.gas.remaining(),
+                cost: self.get_op_cost(gas_spent),
                 depth: context.journal_ref().depth() as u64,
-                refund: interp.control.gas().refunded() as u64,
-                error: Some(format!("{:?}", interp.control.instruction_result())),
+                refund: interp.gas.refunded() as u64,
+                error: interp
+                    .bytecode
+                    .action()
+                    .as_ref()
+                    .and_then(|i| i.instruction_result().map(|i| format!("{i:?}"))),
                 contract: Contract {
                     caller: interp.input.caller_address,
                     contract: interp.input.target_address,
@@ -536,7 +576,7 @@ where
     fn create(&mut self, context: &mut CTX, inputs: &mut CreateInputs) -> Option<CreateOutcome> {
         self.register_precompiles(context);
 
-        let nonce = context.journal().load_account(inputs.caller).unwrap().info.nonce;
+        let nonce = context.journal_mut().load_account(inputs.caller).unwrap().info.nonce;
         let contract = inputs.created_address(nonce);
         self.push_call(
             contract,
@@ -652,7 +692,7 @@ fn js_error_to_revert(err: JsError) -> InterpreterResult {
 mod tests {
     use super::*;
 
-    use alloy_primitives::{hex, Address};
+    use alloy_primitives::{bytes, hex, Address};
     use revm::{
         context::TxEnv,
         database::CacheDB,
@@ -722,7 +762,7 @@ mod tests {
             .build_mainnet_with_inspector(insp);
 
         let res = evm
-            .inspect_with_tx(TxEnv {
+            .inspect_tx(TxEnv {
                 gas_price: 1024,
                 gas_limit: 1_000_000,
                 gas_priority_fee: None,
@@ -916,5 +956,100 @@ mod tests {
         }"#;
         let res = run_trace(code, None, true);
         assert_eq!(res.as_object().unwrap().values().map(|v| v.as_u64().unwrap()).sum::<u64>(), 0);
+    }
+
+    #[test]
+    fn test_individual_opcode_costs() {
+        let code = r#"{
+            res: [],
+            step: function(log) {
+                this.res.push(log.getCost());
+            },
+            fault: function() {},
+            result: function() { return this.res }
+        }"#;
+        let res = run_trace(code, None, true);
+
+        assert_eq!(
+            res.as_array().unwrap().iter().map(|v| v.as_u64().unwrap_or(0)).collect::<Vec<u64>>(),
+            vec![0, 3, 3]
+        );
+    }
+
+    #[test]
+    fn test_slice_builtin() {
+        let code = r#"{
+            res: [],
+            step: function(log) {
+                // Test slicing a hex string
+                var hex = '0xdeadbeefcafe';
+                this.res.push(toHex(slice(hex, 0, 2)));
+                this.res.push(toHex(slice(hex, 2, 4)));
+                this.res.push(toHex(slice(hex, 4, 6)));
+                
+                // Test slicing an array
+                var arr = [0x01, 0x02, 0x03, 0x04, 0x05];
+                this.res.push(toHex(slice(arr, 0, 3)));
+                this.res.push(toHex(slice(arr, 1, 4)));
+                
+                // Test slicing a Uint8Array
+                var uint8 = new Uint8Array([0xff, 0xee, 0xdd, 0xcc, 0xbb]);
+                this.res.push(toHex(slice(uint8, 0, 2)));
+                this.res.push(toHex(slice(uint8, 2, 5)));
+            },
+            fault: function() {},
+            result: function() { return this.res }
+        }"#;
+        let res = run_trace(code, Some(bytes!("0x00")), true);
+        assert_eq!(
+            res,
+            json!(["0xdead", "0xbeef", "0xcafe", "0x010203", "0x020304", "0xffee", "0xddccbb"])
+        );
+    }
+
+    #[test]
+    fn test_is_precompiled_builtin() {
+        let code = r#"{
+            res: [],
+            step: function(log) {
+                this.res.push(isPrecompiled("0x01"));
+                this.res.push(isPrecompiled("0x0000000000000000000000000000000000000002"));
+                this.res.push(isPrecompiled("0x0000000000000000000000000000000000000000"));
+            },
+            fault: function() {},
+            result: function() { return this.res }
+        }"#;
+        let res = run_trace(code, Some(bytes!("0x00")), true);
+        assert_eq!(res, json!([true, true, false]));
+    }
+
+    #[test]
+    fn test_has_own_property() {
+        let code = r#"{
+            res: [],
+            step: function(log) {
+                this.res.push(log.hasOwnProperty("stack"));
+            },
+            fault: function() {},
+            result: function() { return this.res }
+        }"#;
+        let res = run_trace(code, Some(bytes!("0x00")), true);
+        assert_eq!(res, json!([true]));
+    }
+
+    #[test]
+    fn test_slice_with_stack_values() {
+        let code = r#"{
+            res: [],
+            step: function(log) {
+                if ((log.stack.length() > 0) && log.memory.length() >= log.stack.peek(0)) {
+                    this.res.push(log.memory.slice(0, log.stack.peek(0)));
+                }
+            },
+            fault: function() {},
+            result: function() { return this.res }
+        }"#;
+        let res = run_trace(code, Some(bytes!("0x5F5F52600100")), true);
+        assert_eq!(res, json!([json!({}), json!({}), json!({"0": 0})]));
     }
 }

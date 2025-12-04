@@ -3,10 +3,8 @@ use alloy_primitives::{address, b256, Address, Log, LogData, B256, U256};
 use alloy_sol_types::SolValue;
 use revm::{
     context::JournalTr,
-    context_interface::{ContextTr, Transaction},
-    interpreter::{
-        CallInputs, CallOutcome, CreateInputs, CreateOutcome, CreateScheme, EOFCreateKind,
-    },
+    context_interface::ContextTr,
+    interpreter::{CallInputs, CallOutcome, CreateInputs, CreateOutcome, CreateScheme},
     Database, Inspector,
 };
 
@@ -110,7 +108,7 @@ where
                 inputs.transfer_to(),
                 value,
                 TransferKind::Call,
-                context.journal(),
+                context.journal_mut(),
             );
         }
 
@@ -118,7 +116,7 @@ where
     }
 
     fn create(&mut self, context: &mut CTX, inputs: &mut CreateInputs) -> Option<CreateOutcome> {
-        let nonce = context.journal().load_account(inputs.caller).ok()?.data.info.nonce;
+        let nonce = context.journal_mut().load_account(inputs.caller).ok()?.data.info.nonce;
         let address = inputs.created_address(nonce);
 
         let kind = match inputs.scheme {
@@ -127,28 +125,7 @@ where
             CreateScheme::Custom { .. } => return None,
         };
 
-        self.on_transfer(inputs.caller, address, inputs.value, kind, context.journal());
-
-        None
-    }
-
-    fn eofcreate(
-        &mut self,
-        context: &mut CTX,
-        inputs: &mut revm::interpreter::EOFCreateInputs,
-    ) -> Option<CreateOutcome> {
-        let address = match inputs.kind {
-            EOFCreateKind::Tx { .. } => inputs.caller.create(context.tx().nonce()),
-            EOFCreateKind::Opcode { created_address, .. } => created_address,
-        };
-
-        self.on_transfer(
-            inputs.caller,
-            address,
-            inputs.value,
-            TransferKind::EofCreate,
-            context.journal(),
-        );
+        self.on_transfer(inputs.caller, address, inputs.value, kind, context.journal_mut());
 
         None
     }
@@ -187,6 +164,4 @@ pub enum TransferKind {
     Create2,
     /// A SELFDESTRUCT operation
     SelfDestruct,
-    /// A EOFCREATE operation
-    EofCreate,
 }

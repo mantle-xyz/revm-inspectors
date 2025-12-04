@@ -1,6 +1,9 @@
 use alloc::{vec, vec::Vec};
 use alloy_primitives::{map::DefaultHashBuilder, Address, U256};
-use core::hash::{BuildHasher, Hash, Hasher};
+use core::{
+    fmt,
+    hash::{BuildHasher, Hash, Hasher},
+};
 use revm::{
     bytecode::opcode::{self},
     interpreter::{
@@ -17,11 +20,17 @@ const MAX_EDGE_COUNT: usize = 65536;
 /// An `Inspector` that tracks [edge coverage](https://clang.llvm.org/docs/SanitizerCoverage.html#edge-coverage).
 /// Covered edges will not wrap to zero e.g. a loop edge hit more than 255 will still be retained.
 // see https://github.com/AFLplusplus/AFLplusplus/blob/5777ceaf23f48ae4ceae60e4f3a79263802633c6/instrumentation/afl-llvm-pass.so.cc#L810-L829
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct EdgeCovInspector {
     /// Map of hitcounts that can be diffed against to determine if new coverage was reached.
     hitcount: Vec<u8>,
     hash_builder: DefaultHashBuilder,
+}
+
+impl fmt::Debug for EdgeCovInspector {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EdgeCovInspector").finish_non_exhaustive()
+    }
 }
 
 impl EdgeCovInspector {
@@ -51,21 +60,14 @@ impl EdgeCovInspector {
         address.hash(&mut hasher);
         pc.hash(&mut hasher);
         jump_dest.hash(&mut hasher);
-        // The hash is used to index into the hitcount array, so it must be modulo the maximum edge
-        // count.
+        // The hash is used to index into the hitcount array,
+        // so it must be modulo the maximum edge count.
         let edge_id = (hasher.finish() % MAX_EDGE_COUNT as u64) as usize;
         self.hitcount[edge_id] = self.hitcount[edge_id].checked_add(1).unwrap_or(1);
     }
-}
 
-impl Default for EdgeCovInspector {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl<CTX> Inspector<CTX> for EdgeCovInspector {
-    fn step(&mut self, interp: &mut Interpreter, _context: &mut CTX) {
+    #[cold]
+    fn do_step(&mut self, interp: &mut Interpreter) {
         let address = interp.input.target_address(); // TODO track context for delegatecall?
         let current_pc = interp.bytecode.pc();
 
@@ -94,6 +96,21 @@ impl<CTX> Inspector<CTX> for EdgeCovInspector {
             _ => {
                 // no-op
             }
+        }
+    }
+}
+
+impl Default for EdgeCovInspector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<CTX> Inspector<CTX> for EdgeCovInspector {
+    #[inline]
+    fn step(&mut self, interp: &mut Interpreter, _context: &mut CTX) {
+        if matches!(interp.bytecode.opcode(), opcode::JUMP | opcode::JUMPI) {
+            self.do_step(interp);
         }
     }
 }
