@@ -400,11 +400,13 @@ impl OpObj {
         let to_string = FunctionObjectBuilder::new(
             context.realm(),
             NativeFunction::from_copy_closure(move |_this, _args, _ctx| {
-                // We always want an OpCode, even it is unknown because it could be an additional
-                // opcode that not a known constant.
-                let op = unsafe { OpCode::new_unchecked(value) };
-                let s = op.as_str();
-                Ok(JsValue::from(js_string!(s)))
+                if let Some(op) = OpCode::new(value) {
+                    let s = op.as_str();
+                    Ok(JsValue::from(js_string!(s)))
+                } else {
+                    // <https://github.com/ethereum/go-ethereum/blob/7c107c2691fa66a1da60e2b95f5946c3a3921b00/core/vm/opcodes.go#L461-L461>
+                    Ok(JsValue::from(js_string!(format!("opcode {:x} not defined", value))))
+                }
             }),
         )
         .length(0)
@@ -1140,10 +1142,8 @@ mod tests {
 
         let obj = res.as_object().unwrap();
 
-        let result_fn =
-            obj.get(js_string!("result"), &mut context).unwrap().as_object().cloned().unwrap();
-        let setup_fn =
-            obj.get(js_string!("setup"), &mut context).unwrap().as_object().cloned().unwrap();
+        let result_fn = obj.get(js_string!("result"), &mut context).unwrap().as_object().unwrap();
+        let setup_fn = obj.get(js_string!("setup"), &mut context).unwrap().as_object().unwrap();
 
         let db = CacheDB::new(EmptyDB::new());
         let state = EvmState::default();
@@ -1182,10 +1182,8 @@ mod tests {
 
         let obj = eval.as_object().unwrap();
 
-        let result_fn =
-            obj.get(js_string!("result"), &mut context).unwrap().as_object().cloned().unwrap();
-        let step_fn =
-            obj.get(js_string!("step"), &mut context).unwrap().as_object().cloned().unwrap();
+        let result_fn = obj.get(js_string!("result"), &mut context).unwrap().as_object().unwrap();
+        let step_fn = obj.get(js_string!("step"), &mut context).unwrap().as_object().unwrap();
 
         let mut stack = Stack::new();
         let _ = stack.push(U256::from(35000));
@@ -1274,10 +1272,8 @@ mod tests {
 
         let obj = eval.as_object().unwrap();
 
-        let result_fn =
-            obj.get(js_string!("result"), &mut context).unwrap().as_object().cloned().unwrap();
-        let step_fn =
-            obj.get(js_string!("step"), &mut context).unwrap().as_object().cloned().unwrap();
+        let result_fn = obj.get(js_string!("result"), &mut context).unwrap().as_object().unwrap();
+        let step_fn = obj.get(js_string!("step"), &mut context).unwrap().as_object().unwrap();
 
         let mut stack = Stack::new();
         let _ = stack.push(U256::from(35000));
