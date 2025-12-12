@@ -647,3 +647,165 @@ fn test_geth_prestate_disable_code_in_diff_mode() {
         _ => panic!("Expected Diff mode PreStateFrame"),
     }
 }
+
+#[test]
+fn test_geth_calltracer_null_bytes_revert_reason_omitted() {
+    /*
+    Test that verifies revertReason field is omitted when revert data contains only null bytes.
+    This simulates scenarios where contract reverts with empty or null-byte-only data,
+    ensuring compatibility with Geth behavior of omitting such meaningless revert reasons.
+    */
+    let mut evm = Context::mainnet().with_db(CacheDB::new(EmptyDB::default())).build_mainnet();
+
+    // Deploy a simple contract that reverts with empty or null bytes
+    // This bytecode reverts with 32 null bytes: revert(0, 32)
+    // 60206000fd - PUSH1 32, PUSH1 0, REVERT
+    let code = hex!("608060405234801561001057600080fd5b5060988061001f6000396000f3fe6080604052348015600f57600080fd5b506004361060285760003560e01c80633bc5de3014602d575b600080fd5b60336035565b005b60206000fd5b0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000");
+
+    let deployer = Address::ZERO;
+    let addr =
+        deploy_contract(&mut evm, code.into(), deployer, SpecId::LONDON).created_address().unwrap();
+
+    let mut insp = TracingInspector::new(TracingInspectorConfig::default_geth());
+    let mut evm = evm.with_inspector(&mut insp);
+
+    // Call function that reverts with null bytes
+    let res = evm
+        .inspect_tx(TxEnv {
+            caller: deployer,
+            kind: TxKind::Call(addr),
+            data: hex!("3bc5de30").into(), // call function selector
+            gas_limit: 1_000_000,
+            nonce: 1, // Set correct nonce after contract deployment
+            ..Default::default()
+        })
+        .unwrap();
+
+    let call_config = CallConfig::default();
+    let call_frame = insp.geth_builder().geth_call_traces(call_config, res.result.gas_used());
+
+    assert!(call_frame.error.is_some(), "Call should have an error");
+
+    assert!(
+        call_frame.revert_reason.is_none(),
+        "revertReason should be omitted for null-byte-only revert data"
+    );
+
+    // Test JSON serialization to ensure field is omitted
+    assert!(
+        !serde_json::to_value(&call_frame)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .contains_key("revertReason"),
+        "revertReason field should not be present in JSON when containing only null bytes"
+    );
+}
+
+#[test]
+fn test_geth_prestate_diff_selfdestruct_london() {
+    test_geth_prestate_diff_selfdestruct(SpecId::LONDON);
+}
+
+#[test]
+fn test_geth_prestate_diff_selfdestruct_cancun() {
+    test_geth_prestate_diff_selfdestruct(SpecId::CANCUN);
+}
+
+fn test_geth_prestate_diff_selfdestruct(spec_id: SpecId) {
+    /*
+    contract DummySelfDestruct {
+        constructor() payable {}
+        function close() public {
+            selfdestruct(payable(msg.sender));
+        }
+    }
+    */
+
+    // simple contract that selfdestructs when a function is called
+    let code = hex!("608080604052606b908160108239f3fe6004361015600c57600080fd5b6000803560e01c6343d726d614602157600080fd5b346032578060031936011260325733ff5b80fdfea2646970667358221220f393fc6be90126d52315ccd38ae6608ac4fd5bef4c59e119e280b2a2b149d0dc64736f6c63430008190033");
+
+    let deployer = alloy_primitives::address!("341348115259a8bf69f1f50101c227fced83bac6");
+    let value = alloy_primitives::U256::from(69);
+
+    // Deploy the contract in a separate transaction first
+    let mut context = Context::mainnet()
+        .with_db(CacheDB::<EmptyDB>::default())
+        .modify_db_chained(|db| {
+            db.insert_account_info(
+                deployer,
+                revm::state::AccountInfo { balance: value, ..Default::default() },
+            );
+        })
+        .modify_cfg_chained(|cfg| cfg.spec = spec_id);
+
+    context.modify_tx(|tx| tx.value = value);
+    let mut evm = context.build_mainnet();
+    let output = deploy_contract(&mut evm, code.into(), deployer, spec_id);
+    let addr = output.created_address().unwrap();
+
+    // Create inspector with diff mode enabled
+    let prestate_config = PreStateConfig {
+        diff_mode: Some(true),
+        disable_code: Some(false),
+        disable_storage: Some(false),
+    };
+    let insp =
+        TracingInspector::new(TracingInspectorConfig::from_geth_prestate_config(&prestate_config));
+
+    let db = evm.ctx().db().clone();
+    let mut evm = evm.with_inspector(insp);
+
+    let res = evm
+        .inspect_tx(TxEnv {
+            caller: deployer,
+            gas_limit: 1000000,
+            kind: TransactTo::Call(addr),
+            data: hex!("43d726d6").into(),
+            nonce: 1,
+            ..Default::default()
+        })
+        .unwrap();
+
+    assert!(res.result.is_success(), "{res:#?}");
+
+    // Get the prestate diff traces
+    let insp = evm.into_inspector();
+    let frame = insp
+        .with_transaction_gas_used(res.result.gas_used())
+        .geth_builder()
+        .geth_prestate_traces(&res, &prestate_config, db)
+        .unwrap();
+
+    match frame {
+        PreStateFrame::Diff(diff_mode) => {
+            // In LONDON, selfdestruct actually destroys the account
+            // In CANCUN+, due to EIP-6780, selfdestruct on an existing contract only transfers
+            // funds and doesn't actually destroy it
+            let is_post_cancun = spec_id >= SpecId::CANCUN;
+
+            if is_post_cancun {
+                // In CANCUN+, the account is NOT selfdestructed (just balance transfer)
+                // so it WILL be in post state with a changed balance
+                assert!(
+                    diff_mode.post.contains_key(&addr),
+                    "In CANCUN+, non-selfdestructed account should be in post state"
+                );
+            } else {
+                // In pre-CANCUN (e.g. LONDON), the account IS selfdestructed
+                // so it should NOT be in the post state
+                assert!(
+                    !diff_mode.post.contains_key(&addr),
+                    "Selfdestructed account should NOT be in post state (LONDON)"
+                );
+
+                // The account should be in pre state since it existed before
+                assert!(
+                    diff_mode.pre.contains_key(&addr),
+                    "Selfdestructed account should be in pre state (LONDON)"
+                );
+            }
+        }
+        _ => panic!("Expected Diff mode PreStateFrame"),
+    }
+}
