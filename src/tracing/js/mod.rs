@@ -19,7 +19,7 @@ use alloc::{
 };
 use alloy_primitives::{Address, Bytes, U256};
 pub use boa_engine::vm::RuntimeLimits;
-use boa_engine::{js_string, Context, JsError, JsObject, JsResult, JsValue, Source};
+use boa_engine::{js_string, Context, JsError, JsNativeError, JsObject, JsResult, JsValue, Source};
 use core::borrow::Borrow;
 use revm::{
     context::JournalTr,
@@ -275,8 +275,8 @@ impl JsInspector {
         // A hook that threw leaves the tracer's state half-built, so report the failure
         // instead of a trace that silently omits whatever the hook did not record. The error
         // is rebuilt rather than taken, so asking for the result twice answers the same way.
-        if let Some(JsInspectorError::HookFailed { hook, source }) = &self.hook_error {
-            return Err(JsInspectorError::HookFailed { hook, source: source.clone() });
+        if let Some(JsInspectorError::JsError(err)) = &self.hook_error {
+            return Err(JsInspectorError::JsError(err.clone()));
         }
 
         let ResultAndState { result, state } = res;
@@ -341,10 +341,16 @@ impl JsInspector {
 
     /// Records the first error thrown by a tracer hook, tagged with the hook's name.
     ///
-    /// Later errors are dropped: the first one is the one that explains the rest.
+    /// Later errors are dropped: the first one is the one that explains the rest. The hook name
+    /// goes into the message rather than a dedicated variant so that callers mapping
+    /// [`JsInspectorError`] onto their own error types treat it as the JavaScript failure it is
+    /// - reth's `EthApiError` sends every other variant to `InvalidParams`, which this is not.
     fn record_hook_error(&mut self, hook: &'static str, err: JsError) {
         if self.hook_error.is_none() {
-            self.hook_error = Some(JsInspectorError::HookFailed { hook, source: err });
+            let message = format!("{err}    in server-side tracer function '{hook}'");
+            self.hook_error = Some(JsInspectorError::JsError(JsError::from_native(
+                JsNativeError::error().with_message(message),
+            )));
         }
     }
 
@@ -718,17 +724,6 @@ pub enum JsInspectorError {
     /// Failure during the evaluation of JavaScript code.
     #[error("failed to evaluate JS code: {0}")]
     EvalCode(JsError),
-
-    /// One of the tracer's hooks threw, so the trace is abandoned rather than returned
-    /// half-built. go-ethereum likewise records the first hook error and returns it from
-    /// `GetResult()`.
-    #[error("{source}    in server-side tracer function '{hook}'")]
-    HookFailed {
-        /// The hook that threw: `step`, `fault`, `enter` or `exit`.
-        hook: &'static str,
-        /// The underlying JavaScript error.
-        source: JsError,
-    },
 
     /// The evaluated code is not a JavaScript object.
     #[error("the evaluated code is not a JS object")]
@@ -1554,6 +1549,30 @@ mod tests {
             msg.contains("cyclic"),
             "error should name the cyclic reference rather than fail generically, got: {msg}"
         );
+    }
+
+    /// A hook failure must surface as [`JsInspectorError::JsError`], not a variant of its own.
+    ///
+    /// Callers map this enum onto their own error types by matching the variant: reth's
+    /// `EthApiError` sends `JsError` to `InternalJsTracerError` and everything else to
+    /// `InvalidParams`. A runtime failure inside the tracer is the former, not the latter.
+    #[test]
+    fn test_hook_failure_is_reported_as_a_js_error() {
+        let code = r#"{
+            step: function() { throw new Error("boom"); },
+            fault: function() {},
+            result: function() { return null }
+        }"#;
+        let err = try_run_trace(code, None, None, 1_000_000)
+            .expect_err("a throwing step hook must fail the trace");
+
+        assert!(
+            matches!(err, JsInspectorError::JsError(_)),
+            "hook failures must stay in the JsError variant, got: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("boom"), "the JS message must survive, got: {msg}");
+        assert!(msg.contains("step"), "the hook must be named, got: {msg}");
     }
 
     #[test]
