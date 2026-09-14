@@ -4,7 +4,9 @@ use crate::tracing::{
     config::TraceStyle,
     js::{
         bindings::{
-            CallFrame, Contract, EvmDbRef, FrameResult, JsEvmContext, MemoryRef, StackRef, StepLog,
+            CallFrame, Contract, EvmDbRef, FrameResult, JsEvmContext, MemoryRef, MemorySnapshot,
+            ReusableCallFrame, ReusableEvmDb, ReusableFrameResult, ReusableStepLog, StackRef,
+            StepLog,
         },
         builtins::{register_builtins, to_serde_value, PrecompileList},
     },
@@ -27,11 +29,12 @@ use revm::{
         result::{ExecutionResult, HaltReasonTr, Output, ResultAndState},
         Block, ContextTr, TransactTo, Transaction,
     },
+    database::WrapDatabaseRef,
     inspector::JournalExt,
     interpreter::{
         interpreter_types::{Jumps, LoopControl},
         CallInputs, CallOutcome, CallScheme, CreateInputs, CreateOutcome, Gas, InstructionResult,
-        Interpreter, InterpreterAction, InterpreterResult,
+        Interpreter, InterpreterAction, InterpreterResult, Stack,
     },
     DatabaseRef, Inspector,
 };
@@ -49,6 +52,31 @@ pub const LOOP_ITERATION_LIMIT: u64 = 200_000;
 ///
 /// Once exceeded, the function will throw an error.
 pub const RECURSION_LIMIT: usize = 10_000;
+
+/// Pre-execution state captured in `step()` to be used in `step_end()`.
+///
+/// The JS step callback needs the pre-execution stack/memory state but the post-execution gas
+/// cost. This struct holds the snapshot from `step()` so `step_end()` can invoke the callback
+/// with the correct gas cost.
+#[derive(Debug)]
+struct PendingStep {
+    /// Cloned stack from before opcode execution
+    stack: Stack,
+    /// Program counter
+    pc: u64,
+    /// Opcode being executed
+    op: u8,
+    /// Gas remaining before execution
+    gas_remaining: u64,
+    /// Call depth
+    depth: u64,
+    /// Gas refund counter
+    refund: u64,
+    /// Contract info
+    contract: Contract,
+    /// Total gas spent before this opcode (to compute delta in step_end)
+    gas_spent_before: u64,
+}
 
 /// A javascript inspector that will delegate inspector functions to javascript functions
 ///
@@ -84,14 +112,24 @@ pub struct JsInspector {
     exit_fn: Option<JsObject>,
     /// Executed before each instruction is executed.
     step_fn: Option<JsObject>,
+    /// Reused step wrapper to avoid rebuilding the JS object graph per opcode.
+    reusable_step_log: ReusableStepLog,
+    /// Reused frame wrapper to avoid rebuilding the JS object graph per enter callback.
+    reusable_call_frame: ReusableCallFrame,
+    /// Reused frame wrapper to avoid rebuilding the JS object graph per exit callback.
+    reusable_frame_result: ReusableFrameResult,
+    /// Reused database wrapper shared by all callbacks.
+    reusable_db: ReusableEvmDb,
     /// Keeps track of the current call stack.
     call_stack: Vec<CallStackItem>,
     /// Marker to track whether the precompiles have been registered.
     precompiles_registered: bool,
-    /// Tracker for PC recorded in start_step
-    last_start_step_pc: Option<usize>,
-    /// Tracks gas spent in the previous step to calculate individual opcode cost
-    previous_gas_spent: u64,
+    /// Pre-execution state captured in `step()` to be processed in `step_end()`.
+    pending_step: Option<PendingStep>,
+    /// Cached memory snapshot, only updated when the previous opcode modifies memory.
+    cached_memory: MemorySnapshot,
+    /// The opcode from the previous step, used to decide whether to re-snapshot memory.
+    prev_op: Option<OpCode>,
 }
 
 impl JsInspector {
@@ -179,6 +217,14 @@ impl JsInspector {
                 .map_err(JsInspectorError::SetupCallFailed)?;
         }
 
+        let reusable_step_log =
+            ReusableStepLog::new(&mut ctx).map_err(JsInspectorError::EvalCode)?;
+        let reusable_call_frame =
+            ReusableCallFrame::new(&mut ctx).map_err(JsInspectorError::EvalCode)?;
+        let reusable_frame_result =
+            ReusableFrameResult::new(&mut ctx).map_err(JsInspectorError::EvalCode)?;
+        let reusable_db = ReusableEvmDb::new(&mut ctx).map_err(JsInspectorError::EvalCode)?;
+
         Ok(Self {
             ctx,
             code,
@@ -191,10 +237,15 @@ impl JsInspector {
             enter_fn,
             exit_fn,
             step_fn,
+            reusable_step_log,
+            reusable_call_frame,
+            reusable_frame_result,
+            reusable_db,
             call_stack: Default::default(),
             precompiles_registered: false,
-            last_start_step_pc: None,
-            previous_gas_spent: 0,
+            pending_step: None,
+            cached_memory: MemorySnapshot::default(),
+            prev_op: None,
         })
     }
 
@@ -223,16 +274,6 @@ impl JsInspector {
     /// By default
     pub fn set_runtime_limits(&mut self, limits: RuntimeLimits) {
         self.ctx.set_runtime_limits(limits);
-    }
-
-    /// Calculate op cost based on previous gas spent and new spent value
-    fn get_op_cost(&self, spent: u64) -> u64 {
-        spent.saturating_sub(self.previous_gas_spent)
-    }
-
-    /// Set the new previous gas spent value
-    fn set_previous_gas_spent(&mut self, spent: u64) {
-        self.previous_gas_spent = spent;
     }
 
     /// Calls the result function and returns the result as [serde_json::Value].
@@ -267,7 +308,8 @@ impl JsInspector {
         <DB as DatabaseRef>::Error: core::fmt::Display,
     {
         let ResultAndState { result, state } = res;
-        let (db, _db_guard) = EvmDbRef::new(&state, db);
+        let mut db = WrapDatabaseRef(db);
+        let (db, _db_guard) = EvmDbRef::new(&state, &mut db);
 
         let gas_used = result.tx_gas_used();
         let mut to = None;
@@ -330,33 +372,45 @@ impl JsInspector {
     }
 
     fn try_fault(&mut self, step: StepLog, db: EvmDbRef) -> JsResult<()> {
-        let step = step.into_js_object(&mut self.ctx)?;
-        let db = db.into_js_object(&mut self.ctx)?;
-        self.fault_fn.call(&(self.obj.clone().into()), &[step.into(), db.into()], &mut self.ctx)?;
+        self.reusable_step_log.update(step);
+        self.reusable_db.update(db);
+        let step = self.reusable_step_log.value();
+        let db = self.reusable_db.value();
+        self.fault_fn.call(&(self.obj.clone().into()), &[step, db], &mut self.ctx)?;
         Ok(())
     }
 
     fn try_step(&mut self, step: StepLog, db: EvmDbRef) -> JsResult<()> {
         if let Some(step_fn) = &self.step_fn {
-            let step = step.into_js_object(&mut self.ctx)?;
-            let db = db.into_js_object(&mut self.ctx)?;
-            step_fn.call(&(self.obj.clone().into()), &[step.into(), db.into()], &mut self.ctx)?;
+            self.reusable_step_log.update(step);
+            self.reusable_db.update(db);
+            let step = self.reusable_step_log.value();
+            let db = self.reusable_db.value();
+            step_fn.call(&(self.obj.clone().into()), &[step, db], &mut self.ctx)?;
         }
         Ok(())
     }
 
     fn try_enter(&mut self, frame: CallFrame) -> JsResult<()> {
         if let Some(enter_fn) = &self.enter_fn {
-            let frame = frame.into_js_object(&mut self.ctx)?;
-            enter_fn.call(&(self.obj.clone().into()), &[frame.into()], &mut self.ctx)?;
+            self.reusable_call_frame.update(frame);
+            enter_fn.call(
+                &(self.obj.clone().into()),
+                &[self.reusable_call_frame.value()],
+                &mut self.ctx,
+            )?;
         }
         Ok(())
     }
 
     fn try_exit(&mut self, frame: FrameResult) -> JsResult<()> {
         if let Some(exit_fn) = &self.exit_fn {
-            let frame = frame.into_js_object(&mut self.ctx)?;
-            exit_fn.call(&(self.obj.clone().into()), &[frame.into()], &mut self.ctx)?;
+            self.reusable_frame_result.update(frame);
+            exit_fn.call(
+                &(self.obj.clone().into()),
+                &[self.reusable_frame_result.value()],
+                &mut self.ctx,
+            )?;
         }
         Ok(())
     }
@@ -427,50 +481,39 @@ impl JsInspector {
 
 impl<CTX> Inspector<CTX> for JsInspector
 where
-    CTX: ContextTr<Journal: JournalExt, Db: DatabaseRef>,
+    CTX: ContextTr<Journal: JournalExt>,
 {
     fn step(&mut self, interp: &mut Interpreter, context: &mut CTX) {
-        // if this is a revert we need to manually record this so that we can use it in the
-        // step_end fn
-        self.last_start_step_pc = Some(interp.bytecode.pc());
-
         if self.step_fn.is_none() {
             return;
         }
 
-        let (db, _db_guard) = EvmDbRef::new(context.journal_ref().evm_state(), context.db_ref());
+        // Update the cached memory snapshot only if the previous opcode modified memory.
+        // This avoids an expensive Vec<u8> clone on every single step.
+        let should_update_memory = self.prev_op.is_none_or(|prev| prev.modifies_memory());
+        if should_update_memory {
+            self.cached_memory = MemorySnapshot::from_shared_memory(interp.memory.borrow());
+        }
 
-        let (stack, _stack_guard) = StackRef::new(&interp.stack);
-        let evm_memory = interp.memory.borrow();
-        let (memory, _memory_guard) = MemoryRef::new(evm_memory);
+        let op = interp.bytecode.opcode();
+        self.prev_op = OpCode::new(op);
+
         let active_call = self.active_call();
-
-        let gas_spent = interp.gas.total_gas_spent();
-        let step = StepLog {
-            stack,
-            op: interp.bytecode.opcode().into(),
-            memory,
+        self.pending_step = Some(PendingStep {
+            stack: interp.stack.clone(),
             pc: interp.bytecode.pc() as u64,
+            op,
             gas_remaining: interp.gas.remaining(),
-            cost: self.get_op_cost(gas_spent),
             depth: context.journal_ref().depth() as u64,
             refund: interp.gas.refunded() as u64,
-            error: None,
             contract: Contract {
                 caller: interp.input.caller_address,
                 contract: interp.input.target_address,
                 value: active_call.contract.value,
                 input: active_call.contract.input.clone(),
             },
-        };
-
-        self.set_previous_gas_spent(gas_spent);
-
-        if self.try_step(step, db).is_err() {
-            interp
-                .bytecode
-                .set_action(InterpreterAction::new_halt(InstructionResult::Revert, interp.gas));
-        }
+            gas_spent_before: interp.gas.total_gas_spent(),
+        });
     }
 
     fn step_end(&mut self, interp: &mut Interpreter, context: &mut CTX) {
@@ -478,46 +521,66 @@ where
             return;
         }
 
-        if interp
+        let Some(pending) = self.pending_step.take() else {
+            return;
+        };
+
+        let is_revert = interp
             .bytecode
             .action()
             .as_ref()
-            .is_some_and(|a| a.instruction_result().map(|r| r.is_revert()).unwrap_or(false))
-        {
-            let (db, _db_guard) =
-                EvmDbRef::new(context.journal_ref().evm_state(), context.db_ref());
+            .is_some_and(|a| a.instruction_result().map(|r| r.is_revert()).unwrap_or(false));
 
-            let (stack, _stack_guard) = StackRef::new(&interp.stack);
-            let mem = interp.memory.borrow();
-            let (memory, _memory_guard) = MemoryRef::new(mem);
-            let active_call = self.active_call();
-            let gas_spent = interp.gas.total_gas_spent();
+        // Compute the actual gas cost now that the opcode has executed
+        let cost = interp.gas.total_gas_spent().saturating_sub(pending.gas_spent_before);
 
+        let (db_mut, state) = context.journal_mut().db_and_state_mut();
+        let (db, _db_guard) = EvmDbRef::new(state, db_mut);
+
+        let (stack, _stack_guard) = StackRef::new_owned(pending.stack);
+        let (memory, _memory_guard) = MemoryRef::new_owned(self.cached_memory.clone());
+
+        if is_revert {
             let step = StepLog {
                 stack,
-                // we can use REVERT opcode here because we checked that this was a revert
                 op: OpCode::REVERT.get().into(),
-                // Use the recorded pc of the current step for the revert here
-                pc: self.last_start_step_pc.unwrap_or_default() as u64,
+                pc: pending.pc,
                 memory,
-                gas_remaining: interp.gas.remaining(),
-                cost: self.get_op_cost(gas_spent),
-                depth: context.journal_ref().depth() as u64,
-                refund: interp.gas.refunded() as u64,
+                gas_remaining: pending.gas_remaining,
+                cost,
+                depth: pending.depth,
+                refund: pending.refund,
                 error: interp
                     .bytecode
                     .action()
                     .as_ref()
                     .and_then(|i| i.instruction_result().map(|i| format!("{i:?}"))),
-                contract: Contract {
-                    caller: interp.input.caller_address,
-                    contract: interp.input.target_address,
-                    value: active_call.contract.value,
-                    input: active_call.contract.input.clone(),
-                },
+                contract: pending.contract,
             };
-
             let _ = self.try_fault(step, db);
+        } else {
+            let step = StepLog {
+                stack,
+                op: pending.op.into(),
+                memory,
+                pc: pending.pc,
+                gas_remaining: pending.gas_remaining,
+                cost,
+                depth: pending.depth,
+                refund: pending.refund,
+                error: None,
+                contract: pending.contract,
+            };
+            if self.try_step(step, db).is_err() {
+                // Only set revert if the opcode didn't already set an action (e.g. STOP/RETURN).
+                // If the opcode completed successfully, we can't revert it after the fact.
+                if interp.bytecode.action().is_none() {
+                    interp.bytecode.set_action(InterpreterAction::new_halt(
+                        InstructionResult::Revert,
+                        interp.gas,
+                    ));
+                }
+            }
         }
     }
 
@@ -775,7 +838,9 @@ mod tests {
 
         assert_eq!(res.result.is_success(), success);
         let (ctx, inspector) = evm.ctx_inspector();
-        inspector.json_result(res, ctx.tx(), ctx.block(), ctx.db_ref()).unwrap()
+        let tx = ctx.tx().clone();
+        let block = ctx.block().clone();
+        inspector.json_result(res, &tx, &block, ctx.db_mut()).unwrap()
     }
 
     #[test]
@@ -803,6 +868,54 @@ mod tests {
     }
 
     #[test]
+    fn test_memory_slice_rejects_non_finite_indexes() {
+        let code = r#"{
+            depths: [],
+            step: function(log) { this.depths.push(log.memory.slice(Infinity, NaN)); },
+            fault: function() {},
+            result: function() { return this.depths; }
+        }"#;
+        let res = run_trace(code, None, false);
+        assert_eq!(res.as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_memory_slice_rejects_non_finite_end() {
+        let code = r#"{
+            depths: [],
+            step: function(log) { this.depths.push(log.memory.slice(0, Infinity)); },
+            fault: function() {},
+            result: function() { return this.depths; }
+        }"#;
+        let res = run_trace(code, None, false);
+        assert_eq!(res.as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_memory_slice_accepts_bigint_index() {
+        let code = r#"{
+            res: [],
+            step: function(log) { this.res.push(log.memory.slice(0, 0n)); },
+            fault: function() {},
+            result: function() { return this.res; }
+        }"#;
+        let res = run_trace(code, None, true);
+        assert_eq!(res, json!([json!({}), json!({}), json!({})]));
+    }
+
+    #[test]
+    fn test_memory_slice_rejects_bigint_index_overflow() {
+        let code = r#"{
+            depths: [],
+            step: function(log) { this.depths.push(log.memory.slice(0, 340282366920938463463374607431768211455n)); },
+            fault: function() {},
+            result: function() { return this.depths; }
+        }"#;
+        let res = run_trace(code, None, false);
+        assert_eq!(res.as_array().unwrap().len(), 0);
+    }
+
+    #[test]
     fn test_stack_peek() {
         let code = r#"{
             depths: [],
@@ -815,10 +928,58 @@ mod tests {
     }
 
     #[test]
+    fn test_stack_peek_nan() {
+        let code = r#"{
+            depths: [],
+            step: function(log) { this.depths.push(log.stack.peek(NaN)); },
+            fault: function() {},
+            result: function() { return this.depths; }
+        }"#;
+        let res = run_trace(code, None, false);
+        assert_eq!(res.as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_stack_peek_infinity() {
+        let code = r#"{
+            depths: [],
+            step: function(log) { this.depths.push(log.stack.peek(Infinity)); },
+            fault: function() {},
+            result: function() { return this.depths; }
+        }"#;
+        let res = run_trace(code, None, false);
+        assert_eq!(res.as_array().unwrap().len(), 0);
+    }
+
+    #[test]
     fn test_memory_get_uint() {
         let code = r#"{
             depths: [],
             step: function(log, db) { this.depths.push(log.memory.getUint(-64)); },
+            fault: function() {},
+            result: function() { return this.depths; }
+        }"#;
+        let res = run_trace(code, None, false);
+        assert_eq!(res.as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_memory_get_uint_rejects_non_finite_offset() {
+        let code = r#"{
+            depths: [],
+            step: function(log, db) { this.depths.push(log.memory.getUint(Infinity)); },
+            fault: function() {},
+            result: function() { return this.depths; }
+        }"#;
+        let res = run_trace(code, None, false);
+        assert_eq!(res.as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_memory_get_uint_rejects_nan_offset() {
+        let code = r#"{
+            depths: [],
+            step: function(log, db) { this.depths.push(log.memory.getUint(NaN)); },
             fault: function() {},
             result: function() { return this.depths; }
         }"#;
@@ -938,13 +1099,17 @@ mod tests {
 
     #[test]
     fn test_memory_limit() {
+        // Accessing out-of-bounds memory in the tracer results in an empty array.
+        // Since we invoke the JS step callback in step_end (after the opcode executes),
+        // a JS error on the final STOP opcode cannot revert the transaction — it has
+        // already completed. The transaction succeeds but the trace result is empty.
         let code = r#"{
             res: [],
             step: function(log) { if (log.op.toString() === 'STOP') { this.res.push(log.memory.slice(5, 1025 * 1024)) } },
             fault: function() {},
             result: function() { return this.res }
         }"#;
-        let res = run_trace(code, None, false);
+        let res = run_trace(code, None, true);
         assert_eq!(res, json!([]));
     }
 
@@ -972,9 +1137,11 @@ mod tests {
         }"#;
         let res = run_trace(code, None, true);
 
+        // The bytecode is: PUSH1 0x01, PUSH1 0x01, STOP
+        // Expected costs: PUSH1=3, PUSH1=3, STOP=0
         assert_eq!(
             res.as_array().unwrap().iter().map(|v| v.as_u64().unwrap_or(0)).collect::<Vec<u64>>(),
-            vec![0, 3, 3]
+            vec![3, 3, 0]
         );
     }
 
@@ -988,10 +1155,12 @@ mod tests {
                 this.res.push(toHex(slice(hex, 0, 2)));
                 this.res.push(toHex(slice(hex, 2, 4)));
                 this.res.push(toHex(slice(hex, 4, 6)));
+
                 // Test slicing an array
                 var arr = [0x01, 0x02, 0x03, 0x04, 0x05];
                 this.res.push(toHex(slice(arr, 0, 3)));
                 this.res.push(toHex(slice(arr, 1, 4)));
+
                 // Test slicing a Uint8Array
                 var uint8 = new Uint8Array([0xff, 0xee, 0xdd, 0xcc, 0xbb]);
                 this.res.push(toHex(slice(uint8, 0, 2)));
@@ -1038,6 +1207,35 @@ mod tests {
     }
 
     #[test]
+    fn test_step_reuses_log_and_db_objects() {
+        let code = r#"{
+            prevLog: null,
+            prevDb: null,
+            sameLog: [],
+            sameDb: [],
+            step: function(log, db) {
+                if (this.prevLog !== null) {
+                    this.sameLog.push(this.prevLog === log);
+                }
+                if (this.prevDb !== null) {
+                    this.sameDb.push(this.prevDb === db);
+                }
+                this.prevLog = log;
+                this.prevDb = db;
+            },
+            fault: function() {},
+            result: function() {
+                return {
+                    sameLog: this.sameLog,
+                    sameDb: this.sameDb,
+                };
+            }
+        }"#;
+        let res = run_trace(code, None, true);
+        assert_eq!(res, json!({ "sameLog": [true, true], "sameDb": [true, true] }));
+    }
+
+    #[test]
     fn test_slice_with_stack_values() {
         let code = r#"{
             res: [],
@@ -1051,5 +1249,35 @@ mod tests {
         }"#;
         let res = run_trace(code, Some(bytes!("0x5F5F52600100")), true);
         assert_eq!(res, json!([json!({}), json!({}), json!({"0": 0})]));
+    }
+
+    #[test]
+    fn test_bigint_survives_poisoned_global() {
+        let code = r#"{
+            res: {},
+            step: function(log, db) {
+                // Poison the global bigint alias
+                Object.defineProperty(globalThis, 'bigint', {
+                    get() { throw new Error('poisoned bigint'); },
+                    configurable: true
+                });
+
+                if (log.stack.length() > 0) {
+                    // stack.peek internally uses to_bigint
+                    this.res.stackPeek = log.stack.peek(0).toString();
+                }
+                // contract.getValue internally uses to_bigint
+                this.res.value = log.contract.getValue().toString();
+                // db.getBalance internally uses to_bigint
+                this.res.balance = db.getBalance(log.contract.getAddress()).toString();
+            },
+            fault: function() {},
+            result: function() { return this.res }
+        }"#;
+        let res = run_trace(code, None, true);
+        let obj = res.as_object().unwrap();
+        assert_eq!(obj["stackPeek"], json!("1"));
+        assert_eq!(obj["value"], json!("0"));
+        assert_eq!(obj["balance"], json!("0"));
     }
 }

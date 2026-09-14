@@ -14,8 +14,9 @@ use revm::{
         result::{HaltReasonTr, ResultAndState},
         Block, ContextTr, Transaction,
     },
+    handler::FrameResult,
     inspector::JournalExt,
-    interpreter::{CallInputs, CallOutcome, CreateInputs, CreateOutcome, Interpreter},
+    interpreter::{CallInputs, CallOutcome, CreateInputs, CreateOutcome, FrameInput, Interpreter},
     primitives::{Address, Log, U256},
     DatabaseRef, Inspector,
 };
@@ -301,7 +302,7 @@ macro_rules! delegate {
 
 impl<CTX> Inspector<CTX> for DebugInspector
 where
-    CTX: ContextTr<Journal: JournalExt, Db: DatabaseRef>,
+    CTX: ContextTr<Journal: JournalExt>,
 {
     fn initialize_interp(&mut self, interp: &mut Interpreter, context: &mut CTX) {
         delegate!(self => inspector.initialize_interp(interp, context))
@@ -346,6 +347,23 @@ where
 
     fn selfdestruct(&mut self, contract: Address, target: Address, value: U256) {
         delegate!(self => inspector.selfdestruct(contract, target, value))
+    }
+
+    fn frame_start(
+        &mut self,
+        context: &mut CTX,
+        frame_input: &mut FrameInput,
+    ) -> Option<FrameResult> {
+        delegate!(self => inspector.frame_start(context, frame_input))
+    }
+
+    fn frame_end(
+        &mut self,
+        context: &mut CTX,
+        frame_input: &FrameInput,
+        frame_result: &mut FrameResult,
+    ) {
+        delegate!(self => inspector.frame_end(context, frame_input, frame_result))
     }
 }
 
