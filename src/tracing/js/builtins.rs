@@ -14,35 +14,36 @@ use core::borrow::Borrow;
 
 /// Converts the given `JsValue` to a `serde_json::Value`.
 ///
-/// This first attempts to use the built-in `JSON.stringify` function to convert the value to a JSON
-///
-/// If that fails it uses boa's to_json function to convert the value to a JSON object
-///
-/// We use `JSON.stringify` so that `toJSON` properties are used when converting the value to JSON,
-/// this ensures the `bigint` is serialized properly.
+/// Serialization goes through `JSON.stringify` so that `toJSON` properties are honoured, which
+/// is what lets a big integer come out as a decimal string. Boa's own `to_json` is the
+/// fallback; if it fails too, the `JSON.stringify` error is reported, being the informative
+/// one - a circular structure names itself there and not in the fallback.
 pub(crate) fn to_serde_value(val: JsValue, ctx: &mut Context) -> JsResult<serde_json::Value> {
-    if let Ok(json) = json_stringify(val.clone(), ctx) {
-        let json = json.to_std_string().map_err(|err| {
-            JsError::from_native(
-                JsNativeError::error()
-                    .with_message(format!("failed to convert JSON to string: {err}")),
-            )
-        })?;
-        serde_json::from_str(&json).map_err(|err| {
-            JsError::from_native(
-                JsNativeError::error().with_message(format!("failed to parse JSON: {err}")),
-            )
-        })
-    } else {
-        val.to_json(ctx)?.ok_or_else(|| {
-            JsError::from_native(
-                JsNativeError::error().with_message("failed to convert JsValue to JSON"),
-            )
-        })
-    }
+    let stringify_err = match json_stringify(val.clone(), ctx) {
+        Ok(json) => {
+            let json = json.to_std_string().map_err(|err| {
+                JsError::from_native(
+                    JsNativeError::error()
+                        .with_message(format!("failed to convert JSON to string: {err}")),
+                )
+            })?;
+            return serde_json::from_str(&json).map_err(|err| {
+                JsError::from_native(
+                    JsNativeError::error().with_message(format!("failed to parse JSON: {err}")),
+                )
+            });
+        }
+        Err(err) => err,
+    };
+
+    val.to_json(ctx)?.ok_or(stringify_err)
 }
 
 /// Attempts to use the global `JSON` object to stringify the given value.
+///
+/// `JSON.stringify` answers the JavaScript value `undefined` for `undefined`, functions and
+/// symbols. Rendering that as the *string* `"undefined"` would produce text no JSON parser
+/// accepts, so it is mapped to `null`, as go-ethereum's `json.Marshal` does.
 pub(crate) fn json_stringify(val: JsValue, ctx: &mut Context) -> JsResult<JsString> {
     let json = ctx.global_object().get(js_string!("JSON"), ctx)?;
     let json_obj = json.as_object().ok_or_else(|| {
@@ -55,6 +56,9 @@ pub(crate) fn json_stringify(val: JsValue, ctx: &mut Context) -> JsResult<JsStri
         JsError::from_native(JsNativeError::typ().with_message("JSON.stringify is not callable"))
     })?;
     let res = stringify.call(&json, &[val], ctx)?;
+    if res.is_undefined() {
+        return Ok(js_string!("null"));
+    }
     res.to_string(ctx)
 }
 
@@ -410,15 +414,19 @@ pub(crate) fn slice(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResul
     let val = args.get_or_undefined(0).clone();
 
     let buf = bytes_from_value(val, ctx)?;
-    let start = args.get_or_undefined(1).to_numeric_number(ctx)? as usize;
-    let end = args.get_or_undefined(2).to_numeric_number(ctx)? as usize;
+    // Test the floats before converting: `f64 as usize` saturates, so `-1.0` would silently
+    // become `0` and return a slice geth rejects. `MemoryRef::slice` guards the same way.
+    let start_f64 = args.get_or_undefined(1).to_numeric_number(ctx)?;
+    let end_f64 = args.get_or_undefined(2).to_numeric_number(ctx)?;
+    let start = start_f64 as usize;
+    let end = end_f64 as usize;
 
-    if start > end || end > buf.len() {
+    if start_f64 < 0. || end_f64 < 0. || start > end || end > buf.len() {
         Err(JsError::from_native(JsNativeError::error().with_message(format!(
             "Tracer accessed out of bound memory: available {}, start {}, end {}",
             buf.len(),
-            start,
-            end
+            start_f64,
+            end_f64
         ))))
     } else {
         to_uint8_array_value(buf[start..end].iter().copied(), ctx)

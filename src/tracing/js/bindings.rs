@@ -5,7 +5,6 @@ use crate::tracing::{
         address_to_uint8_array, address_to_uint8_array_value, bytes_from_value, bytes_to_address,
         bytes_to_b256, to_bigint, to_uint8_array, to_uint8_array_value,
     },
-    types::CallKind,
     TransactionContext,
 };
 use alloc::{
@@ -27,7 +26,6 @@ use core::cell::RefCell;
 use revm::{
     bytecode::opcode::{OpCode, PUSH0, PUSH32},
     context_interface::DBErrorMarker,
-    interpreter::{SharedMemory, Stack},
     primitives::KECCAK_EMPTY,
     state::{AccountInfo, Bytecode, EvmState},
     DatabaseRef,
@@ -158,6 +156,31 @@ impl<Val> Drop for GcGuard<'_, Val> {
     }
 }
 
+/// Upper bound on the zero padding `memory_copy_padded` will synthesize, matching geth's
+/// `memoryPadLimit`.
+const MEMORY_PAD_LIMIT: usize = 1024 * 1024;
+
+/// Copies `size` bytes from `offset`, zero-filling whatever lies past the end of `mem`.
+///
+/// Reading past the end is ordinary for a tracer - `4byte_tracer_legacy.js` slices four bytes
+/// from an offset the callee has not written yet - so geth pads rather than failing.
+fn memory_copy_padded(mem: &[u8], offset: usize, size: usize) -> Result<Vec<u8>, String> {
+    let len = mem.len();
+    if offset.checked_add(size).is_some_and(|end| end <= len) {
+        return Ok(mem[offset..offset + size].to_vec());
+    }
+    let padding_needed = offset.saturating_add(size).saturating_sub(len);
+    if padding_needed > MEMORY_PAD_LIMIT {
+        return Err(format!("reached limit for padding memory slice: {padding_needed}"));
+    }
+    let mut out = vec![0u8; size];
+    if let Some(overlap) = len.checked_sub(offset).filter(|overlap| *overlap > 0) {
+        let overlap = overlap.min(size);
+        out[..overlap].copy_from_slice(&mem[offset..offset + overlap]);
+    }
+    Ok(out)
+}
+
 /// The Log object that is passed to the javascript inspector.
 #[derive(Debug)]
 pub(crate) struct StepLog {
@@ -239,12 +262,15 @@ impl StepLog {
 
 /// Represents the memory object
 #[derive(Clone, Debug)]
-pub(crate) struct MemoryRef(GuardedNullableGc<SharedMemory>);
+pub(crate) struct MemoryRef(GuardedNullableGc<Vec<u8>>);
 
 impl MemoryRef {
-    /// Creates a new stack reference
-    pub(crate) fn new(mem: &SharedMemory) -> (Self, GcGuard<'_, SharedMemory>) {
-        let (inner, guard) = GuardedNullableGc::new_ref(mem);
+    /// Takes ownership of a snapshot of the current context's memory.
+    ///
+    /// The hook it feeds runs after the instruction has executed, so a borrow of the live
+    /// memory would show the wrong contents. See `JsInspector::step`.
+    pub(crate) fn new<'a>(mem: Vec<u8>) -> (Self, GcGuard<'a, Vec<u8>>) {
+        let (inner, guard) = GuardedNullableGc::new_owned(mem);
         (Self(inner), guard)
     }
 
@@ -272,7 +298,12 @@ impl MemoryRef {
                 move |_this, args, memory, ctx| {
                     let start = args.get_or_undefined(0).to_numeric_number(ctx)?;
                     let end = args.get_or_undefined(1).to_numeric_number(ctx)?;
-                    if end < start || start < 0. || (end as usize) > memory.len() {
+                    // geth answers an empty range before rejecting negatives, so `slice(-1, -1)`
+                    // yields an empty array rather than an error.
+                    if end == start {
+                        return to_uint8_array_value(Vec::new(), ctx);
+                    }
+                    if end < start || start < 0. {
                         return Err(JsError::from_native(JsNativeError::typ().with_message(
                             format!(
                                 "tracer accessed out of bound memory: offset {start}, end {end}"
@@ -280,12 +311,14 @@ impl MemoryRef {
                         )));
                     }
                     let start = start as usize;
-                    let end = end as usize;
-                    let size = end - start;
+                    let size = end as usize - start;
                     let slice = memory
                         .0
-                        .with_inner(|mem| mem.slice_len(start, size).to_vec())
-                        .unwrap_or_default();
+                        .with_inner(|mem| memory_copy_padded(mem, start, size))
+                        .unwrap_or_else(|| Ok(Vec::new()))
+                        .map_err(|msg| {
+                            JsError::from_native(JsNativeError::typ().with_message(msg))
+                        })?;
 
                     to_uint8_array_value(slice, ctx)
                 },
@@ -299,18 +332,22 @@ impl MemoryRef {
             ctx.realm(),
             NativeFunction::from_copy_closure_with_captures(
                 move |_this, args, memory, ctx| {
-                    let offset_f64 = args.get_or_undefined(0).to_numeric_number(ctx)?;
+                    let offset = args.get_or_undefined(0).to_numeric_number(ctx)?;
                     let len = memory.len();
-                    let offset = offset_f64 as usize;
-                    if len < offset + 32 || offset_f64 < 0. {
+                    // `f64 as usize` saturates, so on a huge argument `offset + 32` would wrap
+                    // past this check and index out of bounds. Validate after converting too.
+                    let in_bounds = offset >= 0.
+                        && (offset as usize).checked_add(32).is_some_and(|end| end <= len);
+                    if !in_bounds {
                         let msg = format!("tracer accessed out of bound memory: available {len}, offset {offset}, size 32");
                         return Err(JsError::from_native(JsNativeError::typ().with_message(msg)));
                     }
                     let slice = memory
                         .0
-                        .with_inner(|mem| mem.slice_len(offset, 32).to_vec())
+                        .with_inner(|mem| mem[offset as usize..offset as usize + 32].to_vec())
                         .unwrap_or_default();
-                    to_uint8_array_value(slice, ctx)
+                    // geth returns a big integer here, not a byte array.
+                    to_bigint(U256::from_be_slice(&slice), ctx)
                 },
                 self,
             ),
@@ -406,7 +443,7 @@ impl OpObj {
                     Ok(JsValue::from(js_string!(s)))
                 } else {
                     // <https://github.com/ethereum/go-ethereum/blob/7c107c2691fa66a1da60e2b95f5946c3a3921b00/core/vm/opcodes.go#L461-L461>
-                    Ok(JsValue::from(js_string!(format!("opcode {:x} not defined", value))))
+                    Ok(JsValue::from(js_string!(format!("opcode {:#x} not defined", value))))
                 }
             }),
         )
@@ -428,21 +465,26 @@ impl From<u8> for OpObj {
 
 /// Represents the stack object
 #[derive(Debug)]
-pub(crate) struct StackRef(GuardedNullableGc<Stack>);
+pub(crate) struct StackRef(GuardedNullableGc<Vec<U256>>);
 
 impl StackRef {
-    /// Creates a new stack reference
-    pub(crate) fn new(stack: &Stack) -> (Self, GcGuard<'_, Stack>) {
-        let (inner, guard) = GuardedNullableGc::new_ref(stack);
+    /// Takes ownership of a snapshot of the stack, bottom-first.
+    ///
+    /// Owned for the same reason as [`MemoryRef::new`]: the hook runs after the instruction.
+    pub(crate) fn new<'a>(stack: Vec<U256>) -> (Self, GcGuard<'a, Vec<U256>>) {
+        let (inner, guard) = GuardedNullableGc::new_owned(stack);
         (Self(inner), guard)
     }
 
     fn peek(&self, idx: usize, ctx: &mut Context) -> JsResult<JsValue> {
         self.0
             .with_inner(|stack| {
+                // `idx` counts from the top, as `Stack::peek` does.
                 stack
-                    .peek(idx)
-                    .map_err(|_| {
+                    .len()
+                    .checked_sub(idx + 1)
+                    .map(|pos| stack[pos])
+                    .ok_or_else(|| {
                         JsError::from_native(JsNativeError::typ().with_message(format!(
                             "tracer accessed out of bound stack: size {}, index {}",
                             stack.len(),
@@ -601,13 +643,18 @@ impl FrameResult {
 /// Represents the call frame object for enter functions
 pub(crate) struct CallFrame {
     pub(crate) contract: Contract,
-    pub(crate) kind: CallKind,
+    /// The value `getType()` reports. A plain string rather than a `CallKind` because
+    /// selfdestruct is reported as its own frame type, which `CallKind` does not model.
+    pub(crate) kind: &'static str,
     pub(crate) gas: u64,
+    /// `None` reaches JavaScript as `undefined`, which is what geth reports for a static call.
+    pub(crate) value: Option<U256>,
 }
 
 impl CallFrame {
     pub(crate) fn into_js_object(self, ctx: &mut Context) -> JsResult<JsObject> {
-        let Self { contract: Contract { caller, contract, value, input }, kind, gas } = self;
+        let Self { contract: Contract { caller, contract, value: _, input }, kind, gas, value } =
+            self;
         let obj = JsObject::with_object_proto(ctx.intrinsics());
 
         let get_from = FunctionObjectBuilder::new(
@@ -630,7 +677,10 @@ impl CallFrame {
 
         let get_value = FunctionObjectBuilder::new(
             ctx.realm(),
-            NativeFunction::from_copy_closure(move |_this, _args, ctx| to_bigint(value, ctx)),
+            NativeFunction::from_copy_closure(move |_this, _args, ctx| match value {
+                Some(value) => to_bigint(value, ctx),
+                None => Ok(JsValue::undefined()),
+            }),
         )
         .length(0)
         .build();
@@ -647,7 +697,7 @@ impl CallFrame {
         .build();
 
         let get_gas = js_value_getter!(gas, ctx);
-        let ty = js_string!(kind.to_string());
+        let ty = JsString::from(kind);
         let get_type = js_value_capture_getter!(ty, ctx);
 
         obj.set(js_string!("getFrom"), get_from, false, ctx)?;
@@ -713,8 +763,6 @@ pub(crate) struct JsEvmContext {
     /// `gasPrice` name this excludes the base fee, matching go-ethereum, whose `OnTxStart`
     /// assigns `tx.EffectiveGasTip(baseFee)`.
     pub(crate) gas_price: U256,
-    /// Number, intrinsic gas for the transaction being executed
-    pub(crate) intrinsic_gas: u64,
     /// big.int Amount to be transferred in wei
     pub(crate) value: U256,
     /// Number, block number
@@ -722,8 +770,6 @@ pub(crate) struct JsEvmContext {
     /// Address, miner of the block
     pub(crate) coinbase: Address,
     pub(crate) output: Bytes,
-    /// Number, block timestamp
-    pub(crate) time: String,
     pub(crate) transaction_ctx: TransactionContext,
     /// returns information about the error if one occurred, otherwise returns undefined
     pub(crate) error: Option<String>,
@@ -739,12 +785,10 @@ impl JsEvmContext {
             gas,
             gas_used,
             gas_price,
-            intrinsic_gas,
             value,
             block,
             coinbase,
             output,
-            time,
             transaction_ctx,
             error,
         } = self;
@@ -764,12 +808,10 @@ impl JsEvmContext {
         obj.set(js_string!("gas"), gas, false, ctx)?;
         obj.set(js_string!("gasUsed"), gas_used, false, ctx)?;
         define_lazy_bigint(&obj, "gasPrice", gas_price, ctx)?;
-        obj.set(js_string!("intrinsicGas"), intrinsic_gas, false, ctx)?;
         define_lazy_bigint(&obj, "value", value, ctx)?;
         obj.set(js_string!("block"), block, false, ctx)?;
         obj.set(js_string!("coinbase"), address_to_uint8_array(coinbase, ctx)?, false, ctx)?;
         obj.set(js_string!("output"), to_uint8_array(output, ctx)?, false, ctx)?;
-        obj.set(js_string!("time"), js_string!(time), false, ctx)?;
         if let Some(block_hash) = transaction_ctx.block_hash {
             obj.set(js_string!("blockHash"), to_uint8_array(block_hash, ctx)?, false, ctx)?;
         }
@@ -1042,7 +1084,7 @@ mod tests {
     use super::*;
     use crate::tracing::js::builtins::{json_stringify, register_builtins, to_serde_value};
     use boa_engine::Source;
-    use revm::{database::CacheDB, database_interface::EmptyDB};
+    use revm::{database::CacheDB, database_interface::EmptyDB, interpreter::Stack};
 
     #[test]
     fn test_contract() {
@@ -1227,9 +1269,8 @@ mod tests {
         let _ = stack.push(U256::from(35000));
         let _ = stack.push(U256::from(35000));
         let _ = stack.push(U256::from(35000));
-        let (stack_ref, _stack_guard) = StackRef::new(&stack);
-        let mem = SharedMemory::new();
-        let (mem_ref, _mem_guard) = MemoryRef::new(&mem);
+        let (stack_ref, _stack_guard) = StackRef::new(stack.data().clone());
+        let (mem_ref, _mem_guard) = MemoryRef::new(Vec::new());
 
         let step = StepLog {
             stack: stack_ref,
@@ -1317,9 +1358,8 @@ mod tests {
         let _ = stack.push(U256::from(35000));
         let _ = stack.push(U256::from(35000));
         let _ = stack.push(U256::from(35000));
-        let (stack_ref, _stack_guard) = StackRef::new(&stack);
-        let mem = SharedMemory::new();
-        let (mem_ref, _mem_guard) = MemoryRef::new(&mem);
+        let (stack_ref, _stack_guard) = StackRef::new(stack.data().clone());
+        let (mem_ref, _mem_guard) = MemoryRef::new(Vec::new());
 
         let step = StepLog {
             stack: stack_ref,

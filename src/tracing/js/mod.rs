@@ -4,7 +4,8 @@ use crate::tracing::{
     config::TraceStyle,
     js::{
         bindings::{
-            CallFrame, Contract, EvmDbRef, FrameResult, JsEvmContext, MemoryRef, StackRef, StepLog,
+            CallFrame, Contract, EvmDbRef, FrameResult, GcGuard, JsEvmContext, MemoryRef, StackRef,
+            StepLog,
         },
         builtins::{register_builtins, to_serde_value, PrecompileList},
     },
@@ -21,7 +22,6 @@ pub use boa_engine::vm::RuntimeLimits;
 use boa_engine::{js_string, Context, JsError, JsObject, JsResult, JsValue, Source};
 use core::borrow::Borrow;
 use revm::{
-    bytecode::OpCode,
     context::JournalTr,
     context_interface::{
         result::{ExecutionResult, HaltReasonTr, Output, ResultAndState},
@@ -58,8 +58,6 @@ pub struct JsInspector {
     ctx: Context,
     /// The original javascript code used to create this inspector.
     code: String,
-    /// The javascript config provided to the inspector.
-    _js_config_value: JsValue,
     /// The input config object.
     config: serde_json::Value,
     /// The evaluated object that contains the inspector functions.
@@ -90,8 +88,10 @@ pub struct JsInspector {
     precompiles_registered: bool,
     /// Tracker for PC recorded in start_step
     last_start_step_pc: Option<usize>,
-    /// Tracks gas spent in the previous step to calculate individual opcode cost
-    previous_gas_spent: u64,
+    /// Opcode recorded in start_step, so `fault` can report the instruction that failed.
+    last_start_step_op: Option<u8>,
+    /// Snapshot taken in `step`, consumed by `step_end` once the instruction's cost is known.
+    pending_step: Option<PendingStep>,
     /// The first error thrown by one of the tracer's hooks, if any. Mirrors go-ethereum's
     /// `jsTracer.err`: once a hook throws the rest are skipped and [`Self::result`] reports
     /// the error instead of a silently incomplete trace.
@@ -136,6 +136,9 @@ impl JsInspector {
         ctx.runtime_limits_mut().set_recursion_limit(RECURSION_LIMIT);
 
         register_builtins(&mut ctx)?;
+        // geth defines `isPrecompiled` from the start, so `setup` may call it; the real set of
+        // addresses is only known once a frame begins and replaces this one then.
+        PrecompileList(Default::default()).register_callable(&mut ctx)?;
 
         // evaluate the code
         let wrapped = format!("({code})");
@@ -166,27 +169,34 @@ impl JsInspector {
             obj.get(js_string!("enter"), &mut ctx)?.as_object().filter(|o| o.is_callable());
         let exit_fn =
             obj.get(js_string!("exit"), &mut ctx)?.as_object().filter(|o| o.is_callable());
+        // Frame tracing needs both halves: a tracer with only one of them silently records
+        // half a call tree. geth rejects it at construction for the same reason.
+        if enter_fn.is_some() != exit_fn.is_some() {
+            return Err(JsInspectorError::UnpairedEnterExit);
+        }
         let step_fn =
             obj.get(js_string!("step"), &mut ctx)?.as_object().filter(|o| o.is_callable());
 
-        let _js_config_value =
-            JsValue::from_json(&config, &mut ctx).map_err(JsInspectorError::InvalidJsonConfig)?;
+        // Validate the config converts to a JS value, even when no `setup` consumes it.
+        JsValue::from_json(&config, &mut ctx).map_err(JsInspectorError::InvalidJsonConfig)?;
 
         if let Some(setup_fn) = obj.get(js_string!("setup"), &mut ctx)?.as_object() {
             if !setup_fn.is_callable() {
                 return Err(JsInspectorError::SetupFunctionNotCallable);
             }
 
-            // call setup()
+            // geth hands `setup` the raw JSON text rather than a parsed object, defaulting to
+            // "{}" when absent, so the documented `JSON.parse(config)` idiom works.
+            let cfg = if config.is_null() { String::from("{}") } else { config.to_string() };
+            let cfg = JsValue::from(js_string!(cfg));
             setup_fn
-                .call(&(obj.clone().into()), core::slice::from_ref(&_js_config_value), &mut ctx)
+                .call(&(obj.clone().into()), core::slice::from_ref(&cfg), &mut ctx)
                 .map_err(JsInspectorError::SetupCallFailed)?;
         }
 
         Ok(Self {
             ctx,
             code,
-            _js_config_value,
             config,
             obj,
             transaction_context,
@@ -198,7 +208,8 @@ impl JsInspector {
             call_stack: Default::default(),
             precompiles_registered: false,
             last_start_step_pc: None,
-            previous_gas_spent: 0,
+            last_start_step_op: None,
+            pending_step: None,
             hook_error: None,
         })
     }
@@ -228,16 +239,6 @@ impl JsInspector {
     /// By default
     pub fn set_runtime_limits(&mut self, limits: RuntimeLimits) {
         self.ctx.set_runtime_limits(limits);
-    }
-
-    /// Calculate op cost based on previous gas spent and new spent value
-    fn get_op_cost(&self, spent: u64) -> u64 {
-        spent.saturating_sub(self.previous_gas_spent)
-    }
-
-    /// Set the new previous gas spent value
-    fn set_previous_gas_spent(&mut self, spent: u64) {
-        self.previous_gas_spent = spent;
     }
 
     /// Calls the result function and returns the result as [serde_json::Value].
@@ -315,7 +316,9 @@ impl JsInspector {
             }
             .to_string(),
             from: tx.caller(),
-            to,
+            // geth takes this from the `OnEnter` callback, which for a creation carries the
+            // computed address whether or not the deployment succeeded.
+            to: to.or_else(|| Some(tx.caller().create(tx.nonce()))),
             input: tx.input().clone(),
             gas: tx.gas_limit(),
             gas_used,
@@ -324,8 +327,6 @@ impl JsInspector {
             block: block.number().try_into().unwrap_or(u64::MAX),
             coinbase: block.beneficiary(),
             output: output_bytes.unwrap_or_default(),
-            time: block.timestamp().to_string(),
-            intrinsic_gas: 0,
             transaction_ctx: self.transaction_context,
             error,
         };
@@ -465,97 +466,90 @@ where
     CTX: ContextTr<Journal: JournalExt, Db: DatabaseRef>,
 {
     fn step(&mut self, interp: &mut Interpreter, context: &mut CTX) {
-        // if this is a revert we need to manually record this so that we can use it in the
-        // step_end fn
+        // Recorded unconditionally: `step_end` reports these for a faulting instruction even
+        // when the tracer has no `step` hook, which is what geth does.
         self.last_start_step_pc = Some(interp.bytecode.pc());
+        self.last_start_step_op = Some(interp.bytecode.opcode());
 
         if self.step_fn.is_none() {
             return;
         }
 
-        let (db, _db_guard) = EvmDbRef::new(context.journal_ref().evm_state(), context.db_ref());
-
-        let (stack, _stack_guard) = StackRef::new(&interp.stack);
-        let evm_memory = interp.memory.borrow();
-        let (memory, _memory_guard) = MemoryRef::new(evm_memory);
+        // Snapshot rather than borrow. geth reports the cost of the instruction about to run,
+        // which revm only knows once it has run, so the hook fires from `step_end`; by then
+        // the live stack and memory describe the wrong point in time.
         let active_call = self.active_call();
-
-        let gas_spent = interp.gas.total_gas_spent();
-        let step = StepLog {
-            stack,
-            op: interp.bytecode.opcode().into(),
-            memory,
+        self.pending_step = Some(PendingStep {
+            stack: interp.stack.data().clone(),
+            memory: interp.memory.borrow().context_memory().to_vec(),
+            op: interp.bytecode.opcode(),
             pc: interp.bytecode.pc() as u64,
             gas_remaining: interp.gas.remaining(),
-            cost: self.get_op_cost(gas_spent),
             depth: context.journal_ref().depth() as u64,
-            refund: interp.gas.refunded() as u64,
-            error: None,
+            refund: refunded_gas(interp),
             contract: Contract {
                 caller: interp.input.caller_address,
                 contract: interp.input.target_address,
                 value: active_call.contract.value,
                 input: active_call.contract.input.clone(),
             },
-        };
-
-        self.set_previous_gas_spent(gas_spent);
-
-        if let Err(err) = self.try_step(step, db) {
-            self.record_hook_error("step", err);
-            interp
-                .bytecode
-                .set_action(InterpreterAction::new_halt(InstructionResult::Revert, interp.gas));
-        }
+        });
     }
 
     fn step_end(&mut self, interp: &mut Interpreter, context: &mut CTX) {
-        if self.step_fn.is_none() {
-            return;
-        }
-
-        if interp
+        let fault = interp
             .bytecode
             .action()
             .as_ref()
-            .is_some_and(|a| a.instruction_result().map(|r| r.is_revert()).unwrap_or(false))
-        {
+            .and_then(|a| a.instruction_result())
+            .filter(|r| is_fault(*r));
+
+        // The instruction has run, so its cost is now the difference in remaining gas. geth
+        // reports this from `OnOpcode`, which it emits after metering but before executing.
+        if let Some(pending) = self.pending_step.take() {
+            let cost = pending.gas_remaining.saturating_sub(interp.gas.remaining());
             let (db, _db_guard) =
                 EvmDbRef::new(context.journal_ref().evm_state(), context.db_ref());
-
-            let (stack, _stack_guard) = StackRef::new(&interp.stack);
-            let mem = interp.memory.borrow();
-            let (memory, _memory_guard) = MemoryRef::new(mem);
-            let active_call = self.active_call();
-            let gas_spent = interp.gas.total_gas_spent();
-
-            let step = StepLog {
-                stack,
-                // we can use REVERT opcode here because we checked that this was a revert
-                op: OpCode::REVERT.get().into(),
-                // Use the recorded pc of the current step for the revert here
-                pc: self.last_start_step_pc.unwrap_or_default() as u64,
-                memory,
-                gas_remaining: interp.gas.remaining(),
-                cost: self.get_op_cost(gas_spent),
-                depth: context.journal_ref().depth() as u64,
-                refund: interp.gas.refunded() as u64,
-                error: interp
-                    .bytecode
-                    .action()
-                    .as_ref()
-                    .and_then(|i| i.instruction_result().map(|i| format!("{i:?}"))),
-                contract: Contract {
-                    caller: interp.input.caller_address,
-                    contract: interp.input.target_address,
-                    value: active_call.contract.value,
-                    input: active_call.contract.input.clone(),
-                },
-            };
-
-            if let Err(err) = self.try_fault(step, db) {
-                self.record_hook_error("fault", err);
+            let (step, _stack_guard, _memory_guard) = pending.into_step_log(cost, None);
+            if let Err(err) = self.try_step(step, db) {
+                self.record_hook_error("step", err);
+                // Only if the instruction did not already end the frame: setting a second
+                // action panics, and a frame that is ending anyway needs no halt.
+                if interp.bytecode.action().is_none() {
+                    interp.bytecode.set_action(InterpreterAction::new_halt(
+                        InstructionResult::Revert,
+                        interp.gas,
+                    ));
+                }
+                return;
             }
+        }
+
+        let Some(result) = fault else {
+            return;
+        };
+
+        let (db, _db_guard) = EvmDbRef::new(context.journal_ref().evm_state(), context.db_ref());
+        let active_call = self.active_call();
+        let (step, _stack_guard, _memory_guard) = PendingStep {
+            stack: interp.stack.data().clone(),
+            memory: interp.memory.borrow().context_memory().to_vec(),
+            op: self.last_start_step_op.unwrap_or_default(),
+            pc: self.last_start_step_pc.unwrap_or_default() as u64,
+            gas_remaining: interp.gas.remaining(),
+            depth: context.journal_ref().depth() as u64,
+            refund: refunded_gas(interp),
+            contract: Contract {
+                caller: interp.input.caller_address,
+                contract: interp.input.target_address,
+                value: active_call.contract.value,
+                input: active_call.contract.input.clone(),
+            },
+        }
+        .into_step_log(0, utils::fmt_error_msg(result, TraceStyle::Geth));
+
+        if let Err(err) = self.try_fault(step, db) {
+            self.record_hook_error("fault", err);
         }
     }
 
@@ -570,7 +564,9 @@ where
             _ => (inputs.caller, inputs.target_address),
         };
 
-        let value = inputs.transfer_value().unwrap_or_default();
+        // A delegate call carries the parent frame's value as its apparent value, which is what
+        // geth reports for it. A static call has none at all.
+        let value = inputs.transfer_value().or_else(|| inputs.apparent_value()).unwrap_or_default();
         self.push_call(
             contract,
             inputs.input_data(context),
@@ -584,8 +580,10 @@ where
             let call = self.active_call();
             let frame = CallFrame {
                 contract: call.contract.clone(),
-                kind: call.kind,
+                kind: call.kind.to_str(),
                 gas: inputs.gas_limit,
+                // geth passes nil here for a static call, so `getValue()` is `undefined`.
+                value: (!matches!(inputs.scheme, CallScheme::StaticCall)).then_some(value),
             };
             if let Err(err) = self.try_enter(frame) {
                 self.record_hook_error("enter", err.clone());
@@ -631,8 +629,12 @@ where
 
         if self.can_call_enter() {
             let call = self.active_call();
-            let frame =
-                CallFrame { contract: call.contract.clone(), kind: call.kind, gas: call.gas_limit };
+            let frame = CallFrame {
+                contract: call.contract.clone(),
+                kind: call.kind.to_str(),
+                gas: call.gas_limit,
+                value: Some(call.contract.value),
+            };
             if let Err(err) = self.try_enter(frame) {
                 self.record_hook_error("enter", err.clone());
                 return Some(CreateOutcome::new(js_error_to_revert(err), None));
@@ -652,7 +654,9 @@ where
             let frame_result = FrameResult {
                 gas_used: outcome.result.gas.total_gas_spent(),
                 output: outcome.result.output.clone(),
-                error: None,
+                // geth's `OnExit` reports the error for creates as it does for calls, so a
+                // failed deployment must not look successful to the tracer.
+                error: utils::fmt_error_msg(outcome.result.result, TraceStyle::Geth),
             };
             if let Err(err) = self.try_exit(frame_result) {
                 self.record_hook_error("exit", err.clone());
@@ -663,13 +667,24 @@ where
         self.pop_call();
     }
 
-    fn selfdestruct(&mut self, _contract: Address, _target: Address, _value: U256) {
+    fn selfdestruct(&mut self, contract: Address, target: Address, value: U256) {
         // This is exempt from the root call constraint, because selfdestruct is treated as a
         // new scope that is entered and immediately exited.
         if self.enter_fn.is_some() {
-            let call = self.active_call();
-            let frame =
-                CallFrame { contract: call.contract.clone(), kind: call.kind, gas: call.gas_limit };
+            // geth reports the destroyed contract as the caller and the beneficiary as the
+            // callee, with no input and no gas: `OnEnter(depth, SELFDESTRUCT, this,
+            // beneficiary, []byte{}, 0, balance)`.
+            let frame = CallFrame {
+                contract: Contract {
+                    caller: contract,
+                    contract: target,
+                    value,
+                    input: Bytes::new(),
+                },
+                kind: "SELFDESTRUCT",
+                gas: 0,
+                value: Some(value),
+            };
             if let Err(err) = self.try_enter(frame) {
                 self.record_hook_error("enter", err);
             }
@@ -727,6 +742,10 @@ pub enum JsInspectorError {
     #[error("trace object must expose a function fault()")]
     FaultFunctionMissing,
 
+    /// The trace object exposed only one of `enter()` and `exit()`.
+    #[error("trace object must expose either both or none of enter() and exit()")]
+    UnpairedEnterExit,
+
     /// The setup object must be a callable function.
     #[error("setup object must be a function")]
     SetupFunctionNotCallable,
@@ -738,6 +757,85 @@ pub enum JsInspectorError {
     /// Invalid JSON configuration encountered.
     #[error("invalid JSON config: {0}")]
     InvalidJsonConfig(JsError),
+}
+
+/// A snapshot of the interpreter taken before an instruction runs.
+///
+/// The `step` hook needs pre-execution stack and memory but also the instruction's cost, which
+/// is only known afterwards, so the two are bridged by copying rather than borrowing.
+#[derive(Debug)]
+struct PendingStep {
+    stack: Vec<U256>,
+    memory: Vec<u8>,
+    op: u8,
+    pc: u64,
+    gas_remaining: u64,
+    depth: u64,
+    refund: u64,
+    contract: Contract,
+}
+
+impl PendingStep {
+    /// Builds the log handed to JavaScript.
+    ///
+    /// The returned guards revoke the snapshot's JS-visible handles when dropped, so they must
+    /// outlive the hook call.
+    fn into_step_log<'a>(
+        self,
+        cost: u64,
+        error: Option<String>,
+    ) -> (StepLog, GcGuard<'a, Vec<U256>>, GcGuard<'a, Vec<u8>>) {
+        let Self { stack, memory, op, pc, gas_remaining, depth, refund, contract } = self;
+        let (stack, stack_guard) = StackRef::new(stack);
+        let (memory, memory_guard) = MemoryRef::new(memory);
+        let step = StepLog {
+            stack,
+            op: op.into(),
+            memory,
+            pc,
+            gas_remaining,
+            cost,
+            depth,
+            refund,
+            error,
+            contract,
+        };
+        (step, stack_guard, memory_guard)
+    }
+}
+
+/// Whether a terminating instruction result reaches the tracer's `fault` hook.
+///
+/// geth splits on where the error arose: its interpreter validates the stack and charges gas,
+/// then emits `OnOpcode` and sets `logged`, then executes. The deferred handler routes an
+/// error to `OnFault` only when `logged` is set, so faults raised while metering never get
+/// there. revm meters and executes in one step, so the split has to be reconstructed here.
+const fn is_fault(result: InstructionResult) -> bool {
+    use InstructionResult::*;
+    match result {
+        // Normal termination.
+        Stop | Return | SelfDestruct => false,
+        // Rejected before geth emits `OnOpcode`: stack validation and every flavour of
+        // running out of gas, including the memory-sizing overflow geth reports as
+        // `ErrGasUintOverflow`.
+        StackUnderflow | StackOverflow | OutOfGas | MemoryOOG | MemoryLimitOOG | PrecompileOOG
+        | InvalidOperandOOG | ReentrancySentryOOG => false,
+        // Everything else is raised while executing the instruction: REVERT, invalid jump,
+        // undefined opcode, write protection, return-data overrun, and the create failures.
+        _ => true,
+    }
+}
+
+/// Returns the interpreter's refund counter as an unsigned value.
+///
+/// `Gas::refunded` is an `i64` and goes negative when a storage clear is reversed; casting that
+/// straight to `u64` would wrap to roughly 1.8e19. geth reports a `uint64` here.
+///
+/// The two still differ in scope: this counter belongs to the current interpreter, whereas
+/// geth's `StateDB.GetRefund()` spans the whole transaction, so the values disagree inside any
+/// nested call. Aligning that requires the journal's transaction-level counter.
+fn refunded_gas(interp: &Interpreter) -> u64 {
+    interp.gas.refunded().max(0) as u64
 }
 
 /// Converts a JavaScript error into a [InstructionResult::Revert] [InterpreterResult].
@@ -813,14 +911,24 @@ mod tests {
 
     // Helper function to run a trace and return the result
     fn run_trace(code: &str, contract: Option<Bytes>, success: bool) -> serde_json::Value {
-        try_run_trace(code, contract, success).expect("tracer should not fail")
+        run_trace_with_gas(code, contract, success, 1_000_000)
+    }
+
+    fn run_trace_with_gas(
+        code: &str,
+        contract: Option<Bytes>,
+        success: bool,
+        gas_limit: u64,
+    ) -> serde_json::Value {
+        try_run_trace(code, contract, Some(success), gas_limit).expect("tracer should not fail")
     }
 
     /// Like [`run_trace`], but surfaces a tracer failure instead of panicking on it.
     fn try_run_trace(
         code: &str,
         contract: Option<Bytes>,
-        success: bool,
+        success: Option<bool>,
+        gas_limit: u64,
     ) -> Result<serde_json::Value, JsInspectorError> {
         let addr = Address::repeat_byte(0x01);
         let mut db = CacheDB::new(EmptyDB::default());
@@ -852,14 +960,16 @@ mod tests {
         let res = evm
             .inspect_tx(TxEnv {
                 gas_price: 1024,
-                gas_limit: 1_000_000,
+                gas_limit,
                 gas_priority_fee: None,
                 kind: TransactTo::Call(addr),
                 ..Default::default()
             })
             .expect("pass without error");
 
-        assert_eq!(res.result.is_success(), success);
+        if let Some(success) = success {
+            assert_eq!(res.result.is_success(), success);
+        }
         let (ctx, inspector) = evm.ctx_inspector();
         inspector.json_result(res, ctx.tx(), ctx.block(), ctx.db_ref())
     }
@@ -868,7 +978,9 @@ mod tests {
     /// the same: out-of-range accessors call `vm.Interrupt`, the error lands in
     /// `jsTracer.err`, and `GetResult()` returns it rather than a partial trace.
     fn assert_step_hook_fails(code: &str, contract: Option<Bytes>) {
-        let err = try_run_trace(code, contract, false)
+        // Whether the transaction itself fails depends on whether the throw landed before the
+        // frame ended, so only the trace outcome is asserted.
+        let err = try_run_trace(code, contract, None, 1_000_000)
             .expect_err("a throwing step hook must fail the trace");
         let msg = err.to_string();
         assert!(msg.contains("step"), "error should name the failing hook, got: {msg}");
@@ -957,6 +1069,491 @@ mod tests {
         assert_eq!(res["same"], json!(true), "reading twice must yield the same object");
         assert_eq!(res["assigned"], json!(42), "the field must be writable");
         assert_eq!(res["price"], json!(true), "gasPrice must memoize too");
+    }
+
+    /// The selfdestruct frame must describe the destruction, not the enclosing call.
+    ///
+    /// geth emits `OnEnter(depth, SELFDESTRUCT, this, beneficiary, []byte{}, 0, balance)`, so
+    /// `getTo()` is the beneficiary. Reporting the enclosing frame misattributes the recipient.
+    #[test]
+    fn test_selfdestruct_frame_describes_the_destruction() {
+        let contract_addr = Address::repeat_byte(0x01);
+        let beneficiary = Address::repeat_byte(0x02);
+
+        let mut db = CacheDB::new(EmptyDB::default());
+        db.insert_account_info(
+            Address::ZERO,
+            AccountInfo { balance: U256::from(1e18), ..Default::default() },
+        );
+        // PUSH20 <beneficiary>, SELFDESTRUCT
+        let mut code = vec![0x73];
+        code.extend_from_slice(beneficiary.as_slice());
+        code.push(0xff);
+        db.insert_account_info(
+            contract_addr,
+            AccountInfo {
+                balance: U256::from(1234u64),
+                code: Some(Bytecode::new_legacy(code.into())),
+                ..Default::default()
+            },
+        );
+
+        let code = r#"{
+            frames: [],
+            step: function() {},
+            fault: function() {},
+            enter: function(frame) {
+                this.frames.push({
+                    type: frame.getType(),
+                    from: toHex(frame.getFrom()),
+                    to: toHex(frame.getTo()),
+                    value: frame.getValue().toString(),
+                    gas: frame.getGas(),
+                });
+            },
+            exit: function() {},
+            result: function() { return this.frames }
+        }"#;
+        let insp = JsInspector::new(code.to_string(), serde_json::Value::Null).unwrap();
+
+        let mut evm = revm::Context::mainnet()
+            .modify_cfg_chained(|cfg| cfg.spec = SpecId::CANCUN)
+            .with_db(db)
+            .build_mainnet_with_inspector(insp);
+
+        let res = evm
+            .inspect_tx(TxEnv {
+                gas_limit: 1_000_000,
+                kind: TransactTo::Call(contract_addr),
+                ..Default::default()
+            })
+            .expect("pass without error");
+
+        let (ctx, inspector) = evm.ctx_inspector();
+        let res = inspector.json_result(res, ctx.tx(), ctx.block(), ctx.db_ref()).unwrap();
+
+        assert_eq!(
+            res,
+            json!([{
+                "type": "SELFDESTRUCT",
+                "from": contract_addr,
+                "to": beneficiary,
+                "value": "1234",
+                "gas": 0,
+            }])
+        );
+    }
+
+    /// A failed deployment must reach `exit()` carrying an error.
+    ///
+    /// geth's `OnExit` reports errors for creates exactly as it does for calls; reporting
+    /// `undefined` would let a tracer book a reverted deployment as successful.
+    #[test]
+    fn test_create_end_reports_the_error() {
+        // PUSH5 <init code>, PUSH1 0, MSTORE, PUSH1 5, PUSH1 27, PUSH1 0, CREATE, STOP.
+        // MSTORE right-aligns the 5-byte word, so the init code starts at offset 27. The init
+        // code itself is PUSH1 0, PUSH1 0, REVERT.
+        let contract = hex!("6460006000fd6000526005601b6000f000");
+
+        let code = r#"{
+            results: [],
+            step: function() {},
+            fault: function() {},
+            enter: function() {},
+            exit: function(res) { this.results.push(res.getError()) },
+            result: function() { return this.results }
+        }"#;
+        let res = run_trace(code, Some(contract.into()), true);
+        assert_eq!(res, json!(["execution reverted"]));
+    }
+
+    /// `setup` must receive the config as JSON text, as go-ethereum passes it.
+    ///
+    /// The documented idiom is `JSON.parse(config)`; handing over a parsed object instead
+    /// makes that throw, which breaks every configurable third-party tracer.
+    #[test]
+    fn test_setup_receives_json_text() {
+        let code = r#"{
+            seen: null,
+            setup: function(config) {
+                this.seen = { kind: typeof config, raw: config, foo: JSON.parse(config).foo };
+            },
+            step: function() {},
+            fault: function() {},
+            result: function() { return this.seen }
+        }"#;
+        let insp = JsInspector::new(code.to_string(), json!({"foo": 42})).unwrap();
+        let mut evm = revm::Context::mainnet()
+            .with_db(CacheDB::new(EmptyDB::default()))
+            .build_mainnet_with_inspector(insp);
+        let res = evm.inspect_tx(TxEnv { gas_limit: 1_000_000, ..Default::default() }).unwrap();
+        let (ctx, inspector) = evm.ctx_inspector();
+        let res = inspector.json_result(res, ctx.tx(), ctx.block(), ctx.db_ref()).unwrap();
+
+        assert_eq!(res["kind"], json!("string"));
+        assert_eq!(res["raw"], json!(r#"{"foo":42}"#));
+        assert_eq!(res["foo"], json!(42));
+    }
+
+    /// An absent config reaches `setup` as `"{}"`, matching geth's default for a nil config.
+    #[test]
+    fn test_setup_receives_empty_object_by_default() {
+        let code = r#"{
+            seen: null,
+            setup: function(config) { this.seen = config; },
+            step: function() {},
+            fault: function() {},
+            result: function() { return this.seen }
+        }"#;
+        let insp = JsInspector::new(code.to_string(), serde_json::Value::Null).unwrap();
+        let mut evm = revm::Context::mainnet()
+            .with_db(CacheDB::new(EmptyDB::default()))
+            .build_mainnet_with_inspector(insp);
+        let res = evm.inspect_tx(TxEnv { gas_limit: 1_000_000, ..Default::default() }).unwrap();
+        let (ctx, inspector) = evm.ctx_inspector();
+        let res = inspector.json_result(res, ctx.tx(), ctx.block(), ctx.db_ref()).unwrap();
+
+        assert_eq!(res, json!("{}"));
+    }
+
+    /// `fault` must fire for errors raised while executing an instruction, not only reverts.
+    ///
+    /// geth routes anything raised after it emits `OnOpcode` to `OnFault`; only stack
+    /// validation and gas metering, which happen earlier, go elsewhere.
+    #[test]
+    fn test_fault_fires_for_non_revert_execution_errors() {
+        let code = r#"{
+            faults: [],
+            step: function() {},
+            fault: function(log) { this.faults.push({ op: log.op.toString(), err: log.getError() }) },
+            result: function() { return this.faults }
+        }"#;
+
+        // PUSH1 0xff, JUMP - an invalid jump destination.
+        let res = run_trace(code, Some(hex!("60ff56").into()), false);
+        assert_eq!(res, json!([{ "op": "JUMP", "err": "invalid jump destination" }]));
+
+        // 0x0c is not a defined opcode.
+        let res = run_trace(code, Some(hex!("0c").into()), false);
+        assert_eq!(res, json!([{ "op": "opcode 0xc not defined", "err": "invalid opcode" }]));
+    }
+
+    /// Running out of gas is metered before geth emits `OnOpcode`, so it is not a fault.
+    #[test]
+    fn test_fault_skips_out_of_gas() {
+        let code = r#"{
+            faults: 0,
+            step: function() {},
+            fault: function() { this.faults++ },
+            result: function() { return this.faults }
+        }"#;
+        // JUMPDEST, PUSH0, POP, PUSH1 0, JUMP - loops until the gas runs out.
+        let res = run_trace_with_gas(code, Some(hex!("5b5f5060005600").into()), false, 100_000);
+        assert_eq!(res, json!(0));
+    }
+
+    /// A tracer may define `fault` without `step`; geth delivers the hook either way.
+    #[test]
+    fn test_fault_fires_without_a_step_hook() {
+        let code = r#"{
+            seen: false,
+            fault: function() { this.seen = true },
+            result: function() { return this.seen }
+        }"#;
+        // PUSH1 0, PUSH1 0, REVERT
+        let res = run_trace(code, Some(hex!("60006000fd").into()), false);
+        assert_eq!(res, json!(true));
+    }
+
+    /// Measures what deferring the `step` hook to `step_end` would cost.
+    ///
+    /// Doing so requires snapshotting the stack and memory, because the hook would otherwise
+    /// observe post-execution state. Run with
+    /// `cargo test --release --all-features -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "benchmark, run explicitly with --ignored"]
+    fn bench_step_snapshot_cost() {
+        use std::time::Instant;
+
+        fn trace(code: &str, gas: u64) -> (serde_json::Value, f64) {
+            let addr = Address::repeat_byte(0x01);
+            let mut db = CacheDB::new(EmptyDB::default());
+            db.insert_account_info(
+                Address::ZERO,
+                AccountInfo { balance: U256::from(1e18), ..Default::default() },
+            );
+            db.insert_account_info(
+                addr,
+                AccountInfo {
+                    // JUMPDEST, PUSH1 1, PUSH1 0, MSTORE, PUSH1 0, MLOAD, POP, PUSH1 0, JUMP.
+                    // Loops until the gas runs out, touching memory every iteration.
+                    code: Some(Bytecode::new_legacy(hex!("5b60016000526000515060005600").into())),
+                    ..Default::default()
+                },
+            );
+            let insp = JsInspector::new(code.to_string(), serde_json::Value::Null).unwrap();
+            let mut evm = revm::Context::mainnet()
+                .modify_cfg_chained(|cfg| cfg.spec = SpecId::CANCUN)
+                .with_db(db)
+                .build_mainnet_with_inspector(insp);
+
+            let start = Instant::now();
+            let res = evm
+                .inspect_tx(TxEnv {
+                    gas_limit: gas,
+                    kind: TransactTo::Call(addr),
+                    ..Default::default()
+                })
+                .unwrap();
+            let elapsed = start.elapsed().as_secs_f64();
+            let (ctx, inspector) = evm.ctx_inspector();
+            let out = inspector.json_result(res, ctx.tx(), ctx.block(), ctx.db_ref()).unwrap();
+            (out, elapsed)
+        }
+
+        const GAS: u64 = 2_000_000;
+        let counting = r#"{
+            n: 0,
+            step: function() { this.n++ },
+            fault: function() {},
+            result: function() { return this.n }
+        }"#;
+        let no_step = r#"{ fault: function() {}, result: function() { return 0 } }"#;
+
+        // Warm up, then take the better of two runs to blunt scheduler noise.
+        let (steps, _) = trace(counting, GAS);
+        let steps = steps.as_u64().unwrap();
+        let with_step = (0..3).map(|_| trace(counting, GAS).1).fold(f64::MAX, f64::min);
+        let without_step = (0..3).map(|_| trace(no_step, GAS).1).fold(f64::MAX, f64::min);
+
+        let per_step_js = (with_step - without_step) / steps as f64 * 1e9;
+        println!("steps traced                {steps}");
+        println!("per-step JS hook          {per_step_js:>9.0} ns");
+
+        // What a snapshot would add per step, at a few stack depths and memory sizes.
+        for (depth, mem_len) in
+            [(4usize, 32usize), (16, 1024), (64, 8192), (64, 262_144), (64, 1_048_576)]
+        {
+            let stack = vec![U256::from(1u64); depth];
+            let memory = vec![0u8; mem_len];
+            let iters = if mem_len > 100_000 { 2_000 } else { 200_000 };
+            let start = Instant::now();
+            for _ in 0..iters {
+                core::hint::black_box((stack.clone(), memory.clone()));
+            }
+            let per = start.elapsed().as_secs_f64() / f64::from(iters) * 1e9;
+            println!(
+                "snapshot depth={depth:<3} mem={mem_len:<5} {per:>9.0} ns  ({:.1}% of the hook)",
+                per / per_step_js * 100.
+            );
+        }
+    }
+
+    /// `ctx` must not carry fields go-ethereum does not define.
+    ///
+    /// A reader of `ctx.intrinsicGas` gets `undefined` on geth, which an `if` filters out; a
+    /// confident but wrong `0` does not. `ctx.time` never existed as a block timestamp - the
+    /// field geth once had by that name held the execution duration.
+    #[test]
+    fn test_ctx_has_no_fields_geth_lacks() {
+        let code = r#"{
+            step: function() {},
+            fault: function() {},
+            result: function(ctx) {
+                return { gas: typeof ctx.intrinsicGas, time: typeof ctx.time };
+            }
+        }"#;
+        let res = run_trace(code, None, true);
+        assert_eq!(res, json!({ "gas": "undefined", "time": "undefined" }));
+    }
+
+    /// `ctx.to` is the computed contract address even when the deployment failed.
+    ///
+    /// geth reads it from the `OnEnter` callback, which carries the address regardless of the
+    /// outcome; deriving it only from a successful output leaves `null` behind.
+    #[test]
+    fn test_ctx_to_is_set_for_a_failed_creation() {
+        let mut db = CacheDB::new(EmptyDB::default());
+        db.insert_account_info(
+            Address::ZERO,
+            AccountInfo { balance: U256::from(1e18), ..Default::default() },
+        );
+
+        let code = r#"{
+            step: function() {},
+            fault: function() {},
+            result: function(ctx) { return { to: toHex(ctx.to), type: ctx.type } }
+        }"#;
+        let insp = JsInspector::new(code.to_string(), serde_json::Value::Null).unwrap();
+        let mut evm = revm::Context::mainnet()
+            .modify_cfg_chained(|cfg| cfg.spec = SpecId::CANCUN)
+            .with_db(db)
+            .build_mainnet_with_inspector(insp);
+
+        let res = evm
+            .inspect_tx(TxEnv {
+                gas_limit: 1_000_000,
+                kind: TransactTo::Create,
+                // PUSH1 0, PUSH1 0, REVERT
+                data: hex!("60006000fd").into(),
+                ..Default::default()
+            })
+            .expect("pass without error");
+        assert!(!res.result.is_success());
+
+        let (ctx, inspector) = evm.ctx_inspector();
+        let res = inspector.json_result(res, ctx.tx(), ctx.block(), ctx.db_ref()).unwrap();
+
+        assert_eq!(res["type"], json!("CREATE"));
+        assert_eq!(res["to"], json!(Address::ZERO.create(0)));
+    }
+
+    /// A delegate call inherits the parent's value; a static call reports none at all.
+    ///
+    /// geth passes the parent's value to `OnEnter` for `DELEGATECALL` and nil for
+    /// `STATICCALL`, so `frame.getValue()` is `undefined` only in the latter case.
+    #[test]
+    fn test_frame_value_for_delegate_and_static_calls() {
+        // Pushes the six arguments both opcodes take, then the opcode itself and STOP.
+        fn caller_code(op: u8, callee: Address) -> Bytes {
+            let mut code = hex!("6000600060006000").to_vec(); // retLen, retOff, argLen, argOff
+            code.push(0x73); // PUSH20 <callee>
+            code.extend_from_slice(callee.as_slice());
+            code.extend_from_slice(&hex!("61ffff")); // PUSH2 gas
+            code.push(op);
+            code.push(0x00); // STOP
+            code.into()
+        }
+
+        fn frame_value(op: u8) -> serde_json::Value {
+            let outer = Address::repeat_byte(0x01);
+            let callee = Address::repeat_byte(0x02);
+            let mut db = CacheDB::new(EmptyDB::default());
+            db.insert_account_info(
+                Address::ZERO,
+                AccountInfo { balance: U256::from(1e18), ..Default::default() },
+            );
+            db.insert_account_info(
+                outer,
+                AccountInfo {
+                    code: Some(Bytecode::new_legacy(caller_code(op, callee))),
+                    ..Default::default()
+                },
+            );
+            db.insert_account_info(
+                callee,
+                AccountInfo {
+                    code: Some(Bytecode::new_legacy(hex!("00").into())),
+                    ..Default::default()
+                },
+            );
+
+            let code = r#"{
+                seen: null,
+                step: function() {},
+                fault: function() {},
+                enter: function(frame) {
+                    var v = frame.getValue();
+                    this.seen = { kind: typeof v, value: v === undefined ? null : v.toString() };
+                },
+                exit: function() {},
+                result: function() { return this.seen }
+            }"#;
+            let insp = JsInspector::new(code.to_string(), serde_json::Value::Null).unwrap();
+            let mut evm = revm::Context::mainnet()
+                .modify_cfg_chained(|cfg| cfg.spec = SpecId::CANCUN)
+                .with_db(db)
+                .build_mainnet_with_inspector(insp);
+
+            let res = evm
+                .inspect_tx(TxEnv {
+                    gas_limit: 1_000_000,
+                    kind: TransactTo::Call(outer),
+                    value: U256::from(777u64),
+                    ..Default::default()
+                })
+                .expect("pass without error");
+            assert!(res.result.is_success());
+
+            let (ctx, inspector) = evm.ctx_inspector();
+            inspector.json_result(res, ctx.tx(), ctx.block(), ctx.db_ref()).unwrap()
+        }
+
+        // DELEGATECALL keeps the 777 wei the outer call received.
+        assert_eq!(frame_value(0xf4), json!({ "kind": "object", "value": "777" }));
+        // STATICCALL has no value of its own.
+        assert_eq!(frame_value(0xfa), json!({ "kind": "undefined", "value": null }));
+    }
+
+    /// Frame tracing needs both `enter` and `exit`, as geth requires.
+    #[test]
+    fn test_enter_and_exit_must_be_paired() {
+        let only_enter = r#"{
+            enter: function() {}, fault: function() {}, result: function() { return null }
+        }"#;
+        assert!(matches!(
+            JsInspector::new(only_enter.to_string(), serde_json::Value::Null),
+            Err(JsInspectorError::UnpairedEnterExit)
+        ));
+
+        let only_exit = r#"{
+            exit: function() {}, fault: function() {}, result: function() { return null }
+        }"#;
+        assert!(matches!(
+            JsInspector::new(only_exit.to_string(), serde_json::Value::Null),
+            Err(JsInspectorError::UnpairedEnterExit)
+        ));
+
+        let both = r#"{
+            enter: function() {}, exit: function() {},
+            fault: function() {}, result: function() { return null }
+        }"#;
+        assert!(JsInspector::new(both.to_string(), serde_json::Value::Null).is_ok());
+    }
+
+    /// `isPrecompiled` exists during `setup`, before any frame has begun.
+    ///
+    /// geth defines it up front and answers against an empty set until the first transaction
+    /// fills it in; deferring the definition instead makes the call a `ReferenceError`.
+    #[test]
+    fn test_is_precompiled_available_during_setup() {
+        let code = r#"{
+            seen: null,
+            setup: function() { this.seen = typeof isPrecompiled },
+            step: function() {},
+            fault: function() {},
+            result: function() { return this.seen }
+        }"#;
+        let res = run_trace(code, None, true);
+        assert_eq!(res, json!("function"));
+    }
+
+    /// A `result` hook that returns nothing serializes as `null`, as geth's `json.Marshal` does.
+    #[test]
+    fn test_result_returning_undefined_is_null() {
+        let code = r#"{
+            step: function() {},
+            fault: function() {},
+            result: function() {}
+        }"#;
+        assert_eq!(run_trace(code, None, true), serde_json::Value::Null);
+    }
+
+    /// A structure `JSON.stringify` rejects reports why, rather than a generic failure.
+    #[test]
+    fn test_unserializable_result_reports_the_reason() {
+        let code = r#"{
+            step: function() {},
+            fault: function() {},
+            result: function() { var a = {}; a.self = a; return a }
+        }"#;
+        let err = try_run_trace(code, None, Some(true), 1_000_000)
+            .expect_err("a circular structure cannot be serialized");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cyclic"),
+            "error should name the cyclic reference rather than fail generically, got: {msg}"
+        );
     }
 
     #[test]
@@ -1096,6 +1693,44 @@ mod tests {
         assert_eq!(res.as_object().unwrap().values().map(|v| v.as_u64().unwrap()).sum::<u64>(), 0);
     }
 
+    /// `getUint` must reject an offset no conversion can make safe, and must not wrap.
+    ///
+    /// `f64 as usize` saturates to `usize::MAX`, so an unchecked `offset + 32` wraps to 31 and
+    /// passes any bounds test against a memory of 31 bytes or more.
+    #[test]
+    fn test_memory_get_uint_rejects_saturating_offset() {
+        let code = r#"{
+            step: function(log) { if (log.op.toString() === 'STOP') { log.memory.getUint(1e30) } },
+            fault: function() {},
+            result: function() { return null; }
+        }"#;
+        let contract = hex!("60ff60005300"); // expands memory to 32 bytes before STOP
+        assert_step_hook_fails(code, Some(contract.into()));
+    }
+
+    /// `getUint` reads 32 bytes as a number, as geth's `memoryObj.GetUint` does.
+    #[test]
+    fn test_memory_get_uint_returns_big_integer() {
+        let code = r#"{
+            res: null,
+            step: function(log) {
+                if (log.op.toString() === 'STOP') {
+                    var v = log.memory.getUint(0);
+                    this.res = { hex: v.toString(16), kind: typeof v };
+                }
+            },
+            fault: function() {},
+            result: function() { return this.res }
+        }"#;
+        let contract = hex!("60ff60005300"); // writes 0xff at offset 0
+        let res = run_trace(code, Some(contract.into()), true);
+        assert_eq!(res["kind"], json!("object"), "must be a bigInt, not a byte array");
+        assert_eq!(
+            res["hex"],
+            json!("ff00000000000000000000000000000000000000000000000000000000000000")
+        );
+    }
+
     #[test]
     fn test_memory_slice() {
         let code = r#"{
@@ -1110,7 +1745,11 @@ mod tests {
             result: function() { return this.res }
         }"#;
         let contract = hex!("60ff60005300"); // PUSH1, 0xff, PUSH1, 0x00, MSTORE8, STOP
-        assert_step_hook_fails(code, Some(contract.into()));
+                                             // At MSTORE8 the memory is still empty, so both bytes are padding. By STOP the store
+                                             // has expanded it and written 0xff at offset 0.
+        let res = run_trace(code, Some(contract.into()), true);
+        // A Uint8Array serializes as an object keyed by index.
+        assert_eq!(res, json!([{"0": 0, "1": 0}, {"0": 255, "1": 0}]));
     }
 
     #[test]
@@ -1136,6 +1775,10 @@ mod tests {
         assert_eq!(res.as_object().unwrap().values().map(|v| v.as_u64().unwrap()).sum::<u64>(), 0);
     }
 
+    /// `getCost()` reports the cost of the instruction being stepped over.
+    ///
+    /// The default contract is PUSH1, PUSH1, STOP, which costs 3, 3 and 0. Reporting the
+    /// previous instruction's cost instead would shift this to `[0, 3, 3]`.
     #[test]
     fn test_individual_opcode_costs() {
         let code = r#"{
@@ -1150,7 +1793,7 @@ mod tests {
 
         assert_eq!(
             res.as_array().unwrap().iter().map(|v| v.as_u64().unwrap_or(0)).collect::<Vec<u64>>(),
-            vec![0, 3, 3]
+            vec![3, 3, 0]
         );
     }
 
