@@ -136,9 +136,6 @@ impl JsInspector {
         ctx.runtime_limits_mut().set_recursion_limit(RECURSION_LIMIT);
 
         register_builtins(&mut ctx)?;
-        // geth defines `isPrecompiled` from the start, so `setup` may call it; the real set of
-        // addresses is only known once a frame begins and replaces this one then.
-        PrecompileList(Default::default()).register_callable(&mut ctx)?;
 
         // evaluate the code
         let wrapped = format!("({code})");
@@ -1505,21 +1502,36 @@ mod tests {
         assert!(JsInspector::new(both.to_string(), serde_json::Value::Null).is_ok());
     }
 
-    /// `isPrecompiled` exists during `setup`, before any frame has begun.
+    /// `isPrecompiled` is deliberately absent during `setup`, unlike in geth.
     ///
-    /// geth defines it up front and answers against an empty set until the first transaction
-    /// fills it in; deferring the definition instead makes the call a `ReferenceError`.
+    /// geth defines it up front and answers against an empty set, reporting every address as
+    /// not precompiled - an undetectable wrong answer. Failing loudly is preferred here.
     #[test]
-    fn test_is_precompiled_available_during_setup() {
-        let code = r#"{
+    fn test_is_precompiled_absent_during_setup() {
+        let probe = r#"{
             seen: null,
             setup: function() { this.seen = typeof isPrecompiled },
             step: function() {},
             fault: function() {},
             result: function() { return this.seen }
         }"#;
-        let res = run_trace(code, None, true);
-        assert_eq!(res, json!("function"));
+        // Feature-detecting the global stays safe: `typeof` does not throw on an undeclared name.
+        assert_eq!(run_trace(probe, None, true), json!("undefined"));
+
+        let call = r#"{
+            setup: function() { isPrecompiled("0x0000000000000000000000000000000000000001") },
+            step: function() {},
+            fault: function() {},
+            result: function() { return null }
+        }"#;
+        let err = JsInspector::new(call.to_string(), serde_json::Value::Null)
+            // Discarded so that a failure prints the error, not the whole `Context`.
+            .map(|_| ())
+            .expect_err("calling isPrecompiled in setup must fail");
+        assert!(
+            matches!(err, JsInspectorError::SetupCallFailed(_)),
+            "expected the setup call to fail, got: {err}"
+        );
     }
 
     /// A `result` hook that returns nothing serializes as `null`, as geth's `json.Marshal` does.
