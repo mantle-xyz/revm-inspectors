@@ -323,10 +323,12 @@ impl JsInspector {
             gas: tx.gas_limit(),
             gas_used,
             gas_price: U256::from(effective_gas_tip(tx, block.basefee() as u128)),
+            intrinsic_gas: 0,
             value: tx.value(),
             block: block.number().try_into().unwrap_or(u64::MAX),
             coinbase: block.beneficiary(),
             output: output_bytes.unwrap_or_default(),
+            time: block.timestamp().to_string(),
             transaction_ctx: self.transaction_context,
             error,
         };
@@ -821,14 +823,9 @@ const fn is_fault(result: InstructionResult) -> bool {
     }
 }
 
-/// Returns the interpreter's refund counter as an unsigned value.
-///
-/// `Gas::refunded` is an `i64` and goes negative when a storage clear is reversed; casting that
-/// straight to `u64` would wrap to roughly 1.8e19. geth reports a `uint64` here.
-///
-/// The two still differ in scope: this counter belongs to the current interpreter, whereas
-/// geth's `StateDB.GetRefund()` spans the whole transaction, so the values disagree inside any
-/// nested call. Aligning that requires the journal's transaction-level counter.
+/// Returns the interpreter's refund counter as an unsigned value, clamping the negative values
+/// `Gas::refunded` reports when a storage clear is reversed. Scope still differs from geth's
+/// transaction-wide `StateDB.GetRefund()`; aligning needs the journal's transaction-level counter.
 fn refunded_gas(interp: &Interpreter) -> u64 {
     interp.gas.refunded().max(0) as u64
 }
@@ -1344,22 +1341,24 @@ mod tests {
         }
     }
 
-    /// `ctx` must not carry fields go-ethereum does not define.
-    ///
-    /// A reader of `ctx.intrinsicGas` gets `undefined` on geth, which an `if` filters out; a
-    /// confident but wrong `0` does not. `ctx.time` never existed as a block timestamp - the
-    /// field geth once had by that name held the execution duration.
+    /// `ctx.intrinsicGas` and `ctx.time` have no go-ethereum counterpart: geth dropped them in
+    /// #26048 and #26291. They stay for the sake of scripts written against reth, which has
+    /// exposed both since its tracer was forked. `intrinsicGas` remains the unimplemented 0.
     #[test]
-    fn test_ctx_has_no_fields_geth_lacks() {
+    fn test_ctx_keeps_fields_geth_dropped() {
         let code = r#"{
             step: function() {},
             fault: function() {},
             result: function(ctx) {
-                return { gas: typeof ctx.intrinsicGas, time: typeof ctx.time };
+                return {
+                    gasType: typeof ctx.intrinsicGas,
+                    gasIsZero: ctx.intrinsicGas === 0,
+                    time: typeof ctx.time,
+                };
             }
         }"#;
         let res = run_trace(code, None, true);
-        assert_eq!(res, json!({ "gas": "undefined", "time": "undefined" }));
+        assert_eq!(res, json!({ "gasType": "number", "gasIsZero": true, "time": "string" }));
     }
 
     /// `ctx.to` is the computed contract address even when the deployment failed.

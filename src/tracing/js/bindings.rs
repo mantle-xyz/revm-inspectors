@@ -763,6 +763,9 @@ pub(crate) struct JsEvmContext {
     /// `gasPrice` name this excludes the base fee, matching go-ethereum, whose `OnTxStart`
     /// assigns `tx.EffectiveGasTip(baseFee)`.
     pub(crate) gas_price: U256,
+    /// Number, intrinsic gas of the transaction. go-ethereum dropped this field in #26048, so it
+    /// has no geth counterpart. Not implemented here either: the value is always 0.
+    pub(crate) intrinsic_gas: u64,
     /// big.int Amount to be transferred in wei
     pub(crate) value: U256,
     /// Number, block number
@@ -770,6 +773,9 @@ pub(crate) struct JsEvmContext {
     /// Address, miner of the block
     pub(crate) coinbase: Address,
     pub(crate) output: Bytes,
+    /// Number, block timestamp. go-ethereum's `ctx.time` held the tracer's wall time and was
+    /// dropped in #26291 for determinism; a block timestamp keeps the output deterministic.
+    pub(crate) time: String,
     pub(crate) transaction_ctx: TransactionContext,
     /// returns information about the error if one occurred, otherwise returns undefined
     pub(crate) error: Option<String>,
@@ -785,10 +791,12 @@ impl JsEvmContext {
             gas,
             gas_used,
             gas_price,
+            intrinsic_gas,
             value,
             block,
             coinbase,
             output,
+            time,
             transaction_ctx,
             error,
         } = self;
@@ -808,10 +816,12 @@ impl JsEvmContext {
         obj.set(js_string!("gas"), gas, false, ctx)?;
         obj.set(js_string!("gasUsed"), gas_used, false, ctx)?;
         define_lazy_bigint(&obj, "gasPrice", gas_price, ctx)?;
+        obj.set(js_string!("intrinsicGas"), intrinsic_gas, false, ctx)?;
         define_lazy_bigint(&obj, "value", value, ctx)?;
         obj.set(js_string!("block"), block, false, ctx)?;
         obj.set(js_string!("coinbase"), address_to_uint8_array(coinbase, ctx)?, false, ctx)?;
         obj.set(js_string!("output"), to_uint8_array(output, ctx)?, false, ctx)?;
+        obj.set(js_string!("time"), js_string!(time), false, ctx)?;
         if let Some(block_hash) = transaction_ctx.block_hash {
             obj.set(js_string!("blockHash"), to_uint8_array(block_hash, ctx)?, false, ctx)?;
         }
