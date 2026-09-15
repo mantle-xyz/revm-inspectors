@@ -1399,6 +1399,108 @@ mod tests {
         assert_eq!(res["to"], json!(Address::ZERO.create(0)));
     }
 
+    /// Every value `to_bigint` produces must carry the BigInteger.js API, not just the right
+    /// digits. Asserting `toString()` alone would pass just as well on a native `BigInt`,
+    /// whose `.add` does not exist, so each accessor is exercised through a chained call.
+    #[test]
+    fn test_to_bigint_results_are_chainable_everywhere() {
+        let outer = Address::repeat_byte(0x01);
+        let callee = Address::repeat_byte(0x02);
+
+        // MSTORE 42 at offset 0, then DELEGATECALL the callee with gas 0xffff.
+        let mut outer_code = hex!("602a6000526000600060006000").to_vec();
+        outer_code.push(0x73); // PUSH20 <callee>
+        outer_code.extend_from_slice(callee.as_slice());
+        outer_code.extend_from_slice(&hex!("61fffff400")); // PUSH2 0xffff, DELEGATECALL, STOP
+
+        let mut db = CacheDB::new(EmptyDB::default());
+        db.insert_account_info(
+            Address::ZERO,
+            AccountInfo { balance: U256::from(1e18), ..Default::default() },
+        );
+        db.insert_account_info(
+            outer,
+            AccountInfo {
+                code: Some(Bytecode::new_legacy(outer_code.into())),
+                ..Default::default()
+            },
+        );
+        db.insert_account_info(
+            callee,
+            AccountInfo {
+                code: Some(Bytecode::new_legacy(hex!("00").into())),
+                ..Default::default()
+            },
+        );
+
+        let code = r#"{
+            stepSeen: null,
+            enterSeen: null,
+            fault: function() {},
+            step: function(log) {
+                if (this.stepSeen !== null || log.op.toString() !== "DELEGATECALL") {
+                    return;
+                }
+                this.stepSeen = {
+                    peek: log.stack.peek(0).add(1).toString(),
+                    getUint: log.memory.getUint(0).add(1).toString(),
+                    contractValue: log.contract.getValue().add(1).toString(),
+                };
+            },
+            enter: function(frame) {
+                this.enterSeen = frame.getValue().add(1).toString();
+            },
+            exit: function() {},
+            result: function(ctx, db) {
+                return {
+                    stack_peek: this.stepSeen.peek,
+                    memory_getUint: this.stepSeen.getUint,
+                    contract_getValue: this.stepSeen.contractValue,
+                    frame_getValue: this.enterSeen,
+                    ctx_value: ctx.value.add(1).toString(),
+                    ctx_gasPrice: ctx.gasPrice.add(1).toString(),
+                    db_getBalance: db.getBalance(ctx.to).add(1).toString(),
+                };
+            }
+        }"#;
+
+        let insp = JsInspector::new(code.to_string(), serde_json::Value::Null).unwrap();
+        let mut evm = revm::Context::mainnet()
+            .modify_cfg_chained(|cfg| cfg.spec = SpecId::CANCUN)
+            .with_db(db)
+            .build_mainnet_with_inspector(insp);
+
+        let res = evm
+            .inspect_tx(TxEnv {
+                gas_price: 7,
+                gas_limit: 1_000_000,
+                kind: TransactTo::Call(outer),
+                value: U256::from(777u64),
+                ..Default::default()
+            })
+            .expect("pass without error");
+        assert!(res.result.is_success());
+
+        let (ctx, inspector) = evm.ctx_inspector();
+        let result = inspector.json_result(res, ctx.tx(), ctx.block(), ctx.db_ref()).unwrap();
+
+        assert_eq!(
+            result,
+            json!({
+                // DELEGATECALL's topmost argument is the gas it forwards, 0xffff.
+                "stack_peek": "65536",
+                "memory_getUint": "43",
+                "contract_getValue": "778",
+                "frame_getValue": "778",
+                "ctx_value": "778",
+                // Base fee is zero, so the effective tip is the full gas price.
+                "ctx_gasPrice": "8",
+                // `outer` starts empty and receives the 777 wei the transaction carries.
+                "db_getBalance": "778",
+            })
+        );
+    }
+
     /// A delegate call inherits the parent's value; a static call reports none at all.
     ///
     /// geth passes the parent's value to `OnEnter` for `DELEGATECALL` and nil for
