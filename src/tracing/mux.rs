@@ -54,9 +54,9 @@ impl MuxInspector {
             #[allow(unreachable_patterns)]
             match builtin {
                 GethDebugBuiltInTracerType::FourByteTracer => {
-                    if tracer_config.is_some() {
-                        return Err(Error::UnexpectedConfig(builtin));
-                    }
+                    // The config is ignored rather than rejected: geth hands each key's value to
+                    // the matching tracer's constructor, and this one takes none, so a caller
+                    // may well send `{"4byteTracer": {}}`.
                     four_byte = Some(FourByteInspector::default());
                 }
                 GethDebugBuiltInTracerType::CallTracer => {
@@ -77,9 +77,7 @@ impl MuxInspector {
                     configs.push((builtin, TraceConfig::PreState(prestate_config)));
                 }
                 GethDebugBuiltInTracerType::NoopTracer => {
-                    if tracer_config.is_some() {
-                        return Err(Error::UnexpectedConfig(builtin));
-                    }
+                    // Ignored for the same reason as `FourByteTracer` above.
                     configs.push((builtin, TraceConfig::Noop));
                 }
                 GethDebugBuiltInTracerType::FlatCallTracer => {
@@ -104,6 +102,29 @@ impl MuxInspector {
         let tracing = (!configs.is_empty()).then(|| TracingInspector::new(inspector_config));
 
         Ok(MuxInspector { four_byte, tracing, configs })
+    }
+
+    /// Manually set the gas limit of the root trace.
+    ///
+    /// Forwards to [`TracingInspector::set_transaction_gas_limit`]. Without it the wrapped
+    /// tracers report the EVM's inner gas for the root frame, which disagrees with the same
+    /// tracer invoked on its own.
+    #[inline]
+    pub fn set_transaction_gas_limit(&mut self, gas_limit: u64) {
+        if let Some(inspector) = &mut self.tracing {
+            inspector.set_transaction_gas_limit(gas_limit);
+        }
+    }
+
+    /// Manually set the caller address of the root trace.
+    ///
+    /// Forwards to [`TracingInspector::set_transaction_caller`], for the same reason as
+    /// [`Self::set_transaction_gas_limit`].
+    #[inline]
+    pub fn set_transaction_caller(&mut self, caller: Address) {
+        if let Some(inspector) = &mut self.tracing {
+            inspector.set_transaction_caller(caller);
+        }
     }
 
     /// Try converting this [MuxInspector] into a [MuxFrame].
@@ -293,4 +314,32 @@ pub enum Error {
     /// Error when deserializing the config
     #[error("error deserializing config: {0}")]
     InvalidConfig(#[from] serde_json::Error),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_rpc_types_trace::geth::GethDebugTracerConfig;
+
+    /// Tracers that take no config must accept one anyway, as geth does.
+    ///
+    /// geth passes each key's value straight to the matching tracer's constructor, and both of
+    /// these ignore it, so `{"4byteTracer": {}}` is a request geth answers and we must too.
+    #[test]
+    fn test_config_free_tracers_tolerate_a_config() {
+        for builtin in
+            [GethDebugBuiltInTracerType::FourByteTracer, GethDebugBuiltInTracerType::NoopTracer]
+        {
+            for config in [None, Some(GethDebugTracerConfig(serde_json::json!({})))] {
+                let mux = MuxConfig(HashMap::from_iter([(
+                    GethDebugTracerType::BuiltInTracer(builtin),
+                    config.clone(),
+                )]));
+                assert!(
+                    MuxInspector::try_from_config(mux).is_ok(),
+                    "{builtin:?} must accept config {config:?}"
+                );
+            }
+        }
+    }
 }
