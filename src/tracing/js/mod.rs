@@ -1884,8 +1884,7 @@ mod tests {
     fn test_pre_execution_memory_for_writing_opcodes() {
         // Each program writes 0xaa into memory[0..32] first, then has the opcode under test
         // overwrite that word with zeros. The hook for that opcode must still report 0xaa.
-        // RETURNDATACOPY is absent: it needs a preceding call, and a zero length would not
-        // write at all.
+        // RETURNDATACOPY has its own test below, it needs a preceding call to have return data.
         let programs: [(&str, &[u8]); 5] = [
             // PUSH1 0xbb, PUSH1 0, MSTORE
             ("MSTORE", &hex!("60aa60005260bb60005200")),
@@ -1916,6 +1915,32 @@ mod tests {
             let res = run_trace(&code, Some(Bytes::from(program.to_vec())), true);
             assert_eq!(res, json!("170"), "{op} must report the pre-execution 0xaa");
         }
+    }
+
+    /// `RETURNDATACOPY` needs a preceding call to have any return data, so it gets its own
+    /// program: a static call to the identity precompile echoes a marker back, and the copy
+    /// then overwrites a different marker already in memory.
+    #[test]
+    fn test_pre_execution_memory_for_returndatacopy() {
+        // PUSH1 0xbb, PUSH1 32, MSTORE           memory[32..64] = 0xbb
+        // PUSH1 0, PUSH1 0, PUSH1 32, PUSH1 32, PUSH1 4, PUSH2 0xffff, STATICCALL, POP
+        //                                        identity(memory[32..64]) -> return data 0xbb
+        // PUSH1 0xaa, PUSH1 0, MSTORE            memory[0..32] = 0xaa
+        // PUSH1 32, PUSH1 0, PUSH1 0, RETURNDATACOPY, STOP
+        //                                        overwrites memory[0..32] with 0xbb
+        let program = hex!("60bb6020526000600060206020600461fffffa5060aa6000526020600060003e00");
+        let code = r#"{
+            seen: null,
+            fault: function() {},
+            step: function(log) {
+                if (this.seen === null && log.op.toString() === "RETURNDATACOPY") {
+                    this.seen = log.memory.getUint(0).toString();
+                }
+            },
+            result: function() { return this.seen }
+        }"#;
+        let res = run_trace(code, Some(Bytes::from(program.to_vec())), true);
+        assert_eq!(res, json!("170"), "must report 0xaa, the byte before the copy");
     }
 
     /// `EXTCODECOPY` takes its destination from the second stack item, not the first.
