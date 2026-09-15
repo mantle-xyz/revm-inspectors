@@ -24,7 +24,7 @@ use boa_engine::{
 use boa_gc::{empty_trace, Finalize, Trace};
 use core::cell::RefCell;
 use revm::{
-    bytecode::opcode::{OpCode, PUSH0, PUSH32},
+    bytecode::opcode::{self, OpCode, PUSH0, PUSH32},
     context_interface::DBErrorMarker,
     primitives::KECCAK_EMPTY,
     state::{AccountInfo, Bytecode, EvmState},
@@ -160,27 +160,6 @@ impl<Val> Drop for GcGuard<'_, Val> {
 /// `memoryPadLimit`.
 const MEMORY_PAD_LIMIT: usize = 1024 * 1024;
 
-/// Copies `size` bytes from `offset`, zero-filling whatever lies past the end of `mem`.
-///
-/// Reading past the end is ordinary for a tracer - `4byte_tracer_legacy.js` slices four bytes
-/// from an offset the callee has not written yet - so geth pads rather than failing.
-fn memory_copy_padded(mem: &[u8], offset: usize, size: usize) -> Result<Vec<u8>, String> {
-    let len = mem.len();
-    if offset.checked_add(size).is_some_and(|end| end <= len) {
-        return Ok(mem[offset..offset + size].to_vec());
-    }
-    let padding_needed = offset.saturating_add(size).saturating_sub(len);
-    if padding_needed > MEMORY_PAD_LIMIT {
-        return Err(format!("reached limit for padding memory slice: {padding_needed}"));
-    }
-    let mut out = vec![0u8; size];
-    if let Some(overlap) = len.checked_sub(offset).filter(|overlap| *overlap > 0) {
-        let overlap = overlap.min(size);
-        out[..overlap].copy_from_slice(&mem[offset..offset + overlap]);
-    }
-    Ok(out)
-}
-
 /// The Log object that is passed to the javascript inspector.
 #[derive(Debug)]
 pub(crate) struct StepLog {
@@ -260,22 +239,111 @@ impl StepLog {
     }
 }
 
+/// The range of memory an instruction overwrites, as `(offset, size)`.
+///
+/// Only these opcodes write to memory. Calls are absent because their return data lands after
+/// the child frame returns, which is past `step_end`; `CREATE`, `RETURN`, `KECCAK256` and the
+/// `LOG` family only read.
+fn memory_write_range(op: u8, stack: &[U256]) -> Option<(usize, usize)> {
+    let peek = |n: usize| stack.len().checked_sub(n + 1).map(|i| stack[i]);
+    let (offset, size) = match op {
+        opcode::MSTORE => (peek(0)?, U256::from(32)),
+        opcode::MSTORE8 => (peek(0)?, U256::from(1)),
+        opcode::MCOPY | opcode::CALLDATACOPY | opcode::CODECOPY | opcode::RETURNDATACOPY => {
+            (peek(0)?, peek(2)?)
+        }
+        opcode::EXTCODECOPY => (peek(1)?, peek(3)?),
+        _ => return None,
+    };
+    Some((usize::try_from(offset).ok()?, usize::try_from(size).ok()?))
+}
+
+/// What `step` records so that `step_end` can serve the pre-execution memory.
+///
+/// Copying the whole memory costs time proportional to its size, which reaches milliseconds per
+/// instruction once a contract has grown it to megabytes. Only the bytes the instruction is
+/// about to overwrite are kept; the rest is read back from the post-execution memory.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct MemorySnapshot {
+    /// Length before the instruction ran.
+    len: usize,
+    /// Where `patch` starts.
+    patch_offset: usize,
+    /// The pre-execution bytes of the range the instruction overwrites.
+    patch: Vec<u8>,
+}
+
+impl MemorySnapshot {
+    /// A snapshot of memory that the instruction does not modify, of the given length.
+    pub(crate) fn unchanged(len: usize) -> Self {
+        Self { len, ..Default::default() }
+    }
+
+    /// Records the bytes `op` is about to overwrite, given the pre-execution stack and memory.
+    pub(crate) fn record(op: u8, stack: &[U256], memory: &[u8]) -> Self {
+        let mut this = Self { len: memory.len(), ..Default::default() };
+        if let Some((offset, size)) = memory_write_range(op, stack) {
+            if offset < memory.len() && size > 0 {
+                let end = offset.saturating_add(size).min(memory.len());
+                this.patch_offset = offset;
+                this.patch.extend_from_slice(&memory[offset..end]);
+            }
+        }
+        this
+    }
+}
+
+/// The pre-execution memory, reconstructed from a [`MemorySnapshot`] and the memory as it
+/// stands after the instruction ran.
+#[derive(Clone, Debug)]
+pub(crate) struct MemoryView {
+    snapshot: MemorySnapshot,
+    /// Memory after the instruction ran. Kept alive by the [`GcGuard`] handed out with this view.
+    post: &'static [u8],
+}
+
+impl MemoryView {
+    /// The byte at `i` as it was before the instruction ran, or `None` past the end.
+    fn byte(&self, i: usize) -> Option<u8> {
+        if i >= self.snapshot.len {
+            return None;
+        }
+        let patch_len = self.snapshot.patch.len();
+        if i >= self.snapshot.patch_offset && i < self.snapshot.patch_offset + patch_len {
+            return Some(self.snapshot.patch[i - self.snapshot.patch_offset]);
+        }
+        self.post.get(i).copied()
+    }
+
+    /// Copies `size` bytes from `offset`, zero-filling whatever lies past the end.
+    fn copy_padded(&self, offset: usize, size: usize) -> Result<Vec<u8>, String> {
+        let len = self.snapshot.len;
+        let padding_needed = offset.saturating_add(size).saturating_sub(len);
+        if padding_needed > MEMORY_PAD_LIMIT {
+            return Err(format!("reached limit for padding memory slice: {padding_needed}"));
+        }
+        Ok((offset..offset.saturating_add(size)).map(|i| self.byte(i).unwrap_or(0)).collect())
+    }
+}
+
 /// Represents the memory object
 #[derive(Clone, Debug)]
-pub(crate) struct MemoryRef(GuardedNullableGc<Vec<u8>>);
+pub(crate) struct MemoryRef(GuardedNullableGc<MemoryView>);
 
 impl MemoryRef {
-    /// Takes ownership of a snapshot of the current context's memory.
+    /// Pairs the snapshot taken in `step` with the memory as it stands in `step_end`.
     ///
-    /// The hook it feeds runs after the instruction has executed, so a borrow of the live
-    /// memory would show the wrong contents. See `JsInspector::step`.
-    pub(crate) fn new<'a>(mem: Vec<u8>) -> (Self, GcGuard<'a, Vec<u8>>) {
-        let (inner, guard) = GuardedNullableGc::new_owned(mem);
+    /// The returned guard revokes JavaScript's access to `post`, so it must not outlive it.
+    pub(crate) fn new(snapshot: MemorySnapshot, post: &[u8]) -> (Self, GcGuard<'_, MemoryView>) {
+        // SAFETY: the guard is tied to `post`'s lifetime and clears the view when dropped, so
+        // JavaScript can only reach the reference while it is valid.
+        let post: &'static [u8] = unsafe { core::mem::transmute::<&[u8], &'static [u8]>(post) };
+        let (inner, guard) = GuardedNullableGc::new_owned(MemoryView { snapshot, post });
         (Self(inner), guard)
     }
 
     fn len(&self) -> usize {
-        self.0.with_inner(|mem| mem.len()).unwrap_or_default()
+        self.0.with_inner(|view| view.snapshot.len).unwrap_or_default()
     }
 
     pub(crate) fn into_js_object(self, ctx: &mut Context) -> JsResult<JsObject> {
@@ -314,7 +382,7 @@ impl MemoryRef {
                     let size = end as usize - start;
                     let slice = memory
                         .0
-                        .with_inner(|mem| memory_copy_padded(mem, start, size))
+                        .with_inner(|view| view.copy_padded(start, size))
                         .unwrap_or_else(|| Ok(Vec::new()))
                         .map_err(|msg| {
                             JsError::from_native(JsNativeError::typ().with_message(msg))
@@ -342,10 +410,13 @@ impl MemoryRef {
                         let msg = format!("tracer accessed out of bound memory: available {len}, offset {offset}, size 32");
                         return Err(JsError::from_native(JsNativeError::typ().with_message(msg)));
                     }
+                    let offset = offset as usize;
                     let slice = memory
                         .0
-                        .with_inner(|mem| mem[offset as usize..offset as usize + 32].to_vec())
-                        .unwrap_or_default();
+                        .with_inner(|view| {
+                            (offset..offset + 32).map(|i| view.byte(i).unwrap_or(0)).collect()
+                        })
+                        .unwrap_or_else(Vec::new);
                     // geth returns a big integer here, not a byte array.
                     to_bigint(U256::from_be_slice(&slice), ctx)
                 },
@@ -1280,7 +1351,7 @@ mod tests {
         let _ = stack.push(U256::from(35000));
         let _ = stack.push(U256::from(35000));
         let (stack_ref, _stack_guard) = StackRef::new(stack.data().clone());
-        let (mem_ref, _mem_guard) = MemoryRef::new(Vec::new());
+        let (mem_ref, _mem_guard) = MemoryRef::new(MemorySnapshot::unchanged(0), &[]);
 
         let step = StepLog {
             stack: stack_ref,
@@ -1369,7 +1440,7 @@ mod tests {
         let _ = stack.push(U256::from(35000));
         let _ = stack.push(U256::from(35000));
         let (stack_ref, _stack_guard) = StackRef::new(stack.data().clone());
-        let (mem_ref, _mem_guard) = MemoryRef::new(Vec::new());
+        let (mem_ref, _mem_guard) = MemoryRef::new(MemorySnapshot::unchanged(0), &[]);
 
         let step = StepLog {
             stack: stack_ref,

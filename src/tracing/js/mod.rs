@@ -4,8 +4,8 @@ use crate::tracing::{
     config::TraceStyle,
     js::{
         bindings::{
-            CallFrame, Contract, EvmDbRef, FrameResult, GcGuard, JsEvmContext, MemoryRef, StackRef,
-            StepLog,
+            CallFrame, Contract, EvmDbRef, FrameResult, GcGuard, JsEvmContext, MemoryRef,
+            MemorySnapshot, MemoryView, StackRef, StepLog,
         },
         builtins::{register_builtins, to_serde_value, PrecompileList},
     },
@@ -480,14 +480,20 @@ where
             return;
         }
 
-        // Snapshot rather than borrow. geth reports the cost of the instruction about to run,
-        // which revm only knows once it has run, so the hook fires from `step_end`; by then
-        // the live stack and memory describe the wrong point in time.
+        // geth reports the cost of the instruction about to run, which revm only knows once it
+        // has run, so the hook fires from `step_end`. By then the live stack and memory describe
+        // the wrong point in time, hence the stack copy and the record of the bytes about to be
+        // overwritten; `step_end` rebuilds the pre-execution view from those and the live memory.
         let active_call = self.active_call();
+        let op = interp.bytecode.opcode();
+        let memory = {
+            let mem = interp.memory.borrow();
+            MemorySnapshot::record(op, interp.stack.data(), &mem.context_memory())
+        };
         self.pending_step = Some(PendingStep {
             stack: interp.stack.data().clone(),
-            memory: interp.memory.borrow().context_memory().to_vec(),
-            op: interp.bytecode.opcode(),
+            memory,
+            op,
             pc: interp.bytecode.pc() as u64,
             gas_remaining: interp.gas.remaining(),
             depth: context.journal_ref().depth() as u64,
@@ -515,8 +521,16 @@ where
             let cost = pending.gas_remaining.saturating_sub(interp.gas.remaining());
             let (db, _db_guard) =
                 EvmDbRef::new(context.journal_ref().evm_state(), context.db_ref());
-            let (step, _stack_guard, _memory_guard) = pending.into_step_log(cost, None);
-            if let Err(err) = self.try_step(step, db) {
+            // Scoped so the guards and the memory borrow are released before `interp` is used
+            // mutably below.
+            let called = {
+                let mem = interp.memory.borrow();
+                let post_memory = mem.context_memory();
+                let (step, _stack_guard, _memory_guard) =
+                    pending.into_step_log(cost, None, &post_memory);
+                self.try_step(step, db)
+            };
+            if let Err(err) = called {
                 self.record_hook_error("step", err);
                 // Only if the instruction did not already end the frame: setting a second
                 // action panics, and a frame that is ending anyway needs no halt.
@@ -536,9 +550,14 @@ where
 
         let (db, _db_guard) = EvmDbRef::new(context.journal_ref().evm_state(), context.db_ref());
         let active_call = self.active_call();
+        let mem = interp.memory.borrow();
+        let post_memory = mem.context_memory();
+        let post_memory: &[u8] = &post_memory;
+        // The instruction failed, so there is no "before" to rebuild: geth's `OnFault` likewise
+        // reports the state as it stands. An empty snapshot serves the live memory unchanged.
         let (step, _stack_guard, _memory_guard) = PendingStep {
             stack: interp.stack.data().clone(),
-            memory: interp.memory.borrow().context_memory().to_vec(),
+            memory: MemorySnapshot::unchanged(post_memory.len()),
             op: self.last_start_step_op.unwrap_or_default(),
             pc: self.last_start_step_pc.unwrap_or_default() as u64,
             gas_remaining: interp.gas.remaining(),
@@ -551,7 +570,7 @@ where
                 input: active_call.contract.input.clone(),
             },
         }
-        .into_step_log(0, utils::fmt_error_msg(result, TraceStyle::Geth));
+        .into_step_log(0, utils::fmt_error_msg(result, TraceStyle::Geth), post_memory);
 
         if let Err(err) = self.try_fault(step, db) {
             self.record_hook_error("fault", err);
@@ -760,7 +779,7 @@ pub enum JsInspectorError {
 #[derive(Debug)]
 struct PendingStep {
     stack: Vec<U256>,
-    memory: Vec<u8>,
+    memory: MemorySnapshot,
     op: u8,
     pc: u64,
     gas_remaining: u64,
@@ -778,10 +797,11 @@ impl PendingStep {
         self,
         cost: u64,
         error: Option<String>,
-    ) -> (StepLog, GcGuard<'a, Vec<U256>>, GcGuard<'a, Vec<u8>>) {
+        post_memory: &'a [u8],
+    ) -> (StepLog, GcGuard<'a, Vec<U256>>, GcGuard<'a, MemoryView>) {
         let Self { stack, memory, op, pc, gas_remaining, depth, refund, contract } = self;
         let (stack, stack_guard) = StackRef::new(stack);
-        let (memory, memory_guard) = MemoryRef::new(memory);
+        let (memory, memory_guard) = MemoryRef::new(memory, post_memory);
         let step = StepLog {
             stack,
             op: op.into(),
@@ -1262,6 +1282,7 @@ mod tests {
     #[test]
     #[ignore = "benchmark, run explicitly with --ignored"]
     fn bench_step_snapshot_cost() {
+        use revm::bytecode::opcode;
         use std::time::Instant;
 
         fn trace(code: &str, gas: u64) -> (serde_json::Value, f64) {
@@ -1319,21 +1340,36 @@ mod tests {
         println!("steps traced                {steps}");
         println!("per-step JS hook          {per_step_js:>9.0} ns");
 
-        // What a snapshot would add per step, at a few stack depths and memory sizes.
+        // What `step` adds per instruction, at a few stack depths and memory sizes. The stack is
+        // copied whole; of the memory only the range the opcode overwrites is kept, so the cost
+        // no longer tracks memory size. The full copy is measured alongside for comparison.
         for (depth, mem_len) in
             [(4usize, 32usize), (16, 1024), (64, 8192), (64, 262_144), (64, 1_048_576)]
         {
             let stack = vec![U256::from(1u64); depth];
             let memory = vec![0u8; mem_len];
             let iters = if mem_len > 100_000 { 2_000 } else { 200_000 };
+
             let start = Instant::now();
             for _ in 0..iters {
                 core::hint::black_box((stack.clone(), memory.clone()));
             }
-            let per = start.elapsed().as_secs_f64() / f64::from(iters) * 1e9;
+            let full = start.elapsed().as_secs_f64() / f64::from(iters) * 1e9;
+
+            let start = Instant::now();
+            for _ in 0..iters {
+                core::hint::black_box((
+                    stack.clone(),
+                    MemorySnapshot::record(opcode::MSTORE, &stack, &memory),
+                ));
+            }
+            let recorded = start.elapsed().as_secs_f64() / f64::from(iters) * 1e9;
+
             println!(
-                "snapshot depth={depth:<3} mem={mem_len:<5} {per:>9.0} ns  ({:.1}% of the hook)",
-                per / per_step_js * 100.
+                "depth={depth:<3} mem={mem_len:<7} record {recorded:>6.0} ns ({:>5.1}% of hook) \
+                 | full copy {full:>6.0} ns ({:.1}%)",
+                recorded / per_step_js * 100.,
+                full / per_step_js * 100.
             );
         }
     }
@@ -1838,6 +1874,67 @@ mod tests {
         }"#;
         let contract = hex!("60ff60005300"); // expands memory to 32 bytes before STOP
         assert_step_hook_fails(code, Some(contract.into()));
+    }
+
+    /// Every opcode that writes memory must show the tracer the bytes as they were *before*
+    /// the write. `step` records only the range about to be overwritten and `step_end` rebuilds
+    /// the rest from live memory, so an opcode missing from `memory_write_range` would serve
+    /// post-execution bytes instead, without any error.
+    #[test]
+    fn test_pre_execution_memory_for_writing_opcodes() {
+        // Each program writes 0xaa into memory[0..32] first, then has the opcode under test
+        // overwrite that word with zeros. The hook for that opcode must still report 0xaa.
+        // RETURNDATACOPY is absent: it needs a preceding call, and a zero length would not
+        // write at all.
+        let programs: [(&str, &[u8]); 5] = [
+            // PUSH1 0xbb, PUSH1 0, MSTORE
+            ("MSTORE", &hex!("60aa60005260bb60005200")),
+            // PUSH1 0xbb, PUSH1 0, MSTORE8
+            ("MSTORE8", &hex!("60aa60005260bb60005300")),
+            // PUSH1 32, PUSH1 0, PUSH1 0, CALLDATACOPY
+            ("CALLDATACOPY", &hex!("60aa6000526020600060003700")),
+            // PUSH1 32, PUSH1 0, PUSH1 0, CODECOPY
+            ("CODECOPY", &hex!("60aa6000526020600060003900")),
+            // PUSH1 32, PUSH1 32, PUSH1 0, MCOPY
+            ("MCOPY", &hex!("60aa6000526020602060005e00")),
+        ];
+
+        for (op, program) in programs {
+            let code = format!(
+                r#"{{
+                    seen: null,
+                    fault: function() {{}},
+                    step: function(log) {{
+                        if (this.seen === null && log.op.toString() === "{op}"
+                            && log.memory.length() >= 32) {{
+                            this.seen = log.memory.getUint(0).toString();
+                        }}
+                    }},
+                    result: function() {{ return this.seen }}
+                }}"#
+            );
+            let res = run_trace(&code, Some(Bytes::from(program.to_vec())), true);
+            assert_eq!(res, json!("170"), "{op} must report the pre-execution 0xaa");
+        }
+    }
+
+    /// `EXTCODECOPY` takes its destination from the second stack item, not the first.
+    #[test]
+    fn test_pre_execution_memory_for_extcodecopy() {
+        // PUSH1 0xaa, PUSH1 0, MSTORE | PUSH1 32, PUSH1 0, PUSH1 0, ADDRESS, EXTCODECOPY, STOP
+        let program = hex!("60aa600052602060006000303c00");
+        let code = r#"{
+            seen: null,
+            fault: function() {},
+            step: function(log) {
+                if (this.seen === null && log.op.toString() === "EXTCODECOPY") {
+                    this.seen = log.memory.getUint(0).toString();
+                }
+            },
+            result: function() { return this.seen }
+        }"#;
+        let res = run_trace(code, Some(Bytes::from(program.to_vec())), true);
+        assert_eq!(res, json!("170"));
     }
 
     /// `getUint` reads 32 bytes as a number, as geth's `memoryObj.GetUint` does.
