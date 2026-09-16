@@ -948,7 +948,7 @@ impl EvmDbRef {
     }
 
     fn read_basic(&self, address: JsValue, ctx: &mut Context) -> JsResult<Option<AccountInfo>> {
-        let buf = bytes_from_value(address, ctx)?;
+        let buf = bytes_from_value(address, false, ctx)?;
         let address = bytes_to_address(&buf);
         if let acc @ Some(_) = self.inner.state.get_account(&address) {
             return Ok(acc);
@@ -992,10 +992,10 @@ impl EvmDbRef {
         slot: JsValue,
         ctx: &mut Context,
     ) -> JsResult<JsUint8Array> {
-        let buf = bytes_from_value(address, ctx)?;
+        let buf = bytes_from_value(address, false, ctx)?;
         let address = bytes_to_address(&buf);
 
-        let buf = bytes_from_value(slot, ctx)?;
+        let buf = bytes_from_value(slot, false, ctx)?;
         let slot = bytes_to_b256(&buf);
 
         let res = self.inner.db.0.with_inner(|db| db.storage_ref(address, slot.into()));
@@ -1208,7 +1208,7 @@ mod tests {
             .unwrap();
         assert!(res.is_object());
 
-        let buf = bytes_from_value(res, &mut ctx).unwrap();
+        let buf = bytes_from_value(res, true, &mut ctx).unwrap();
         assert_eq!(buf, contract.contract.as_slice());
 
         let call = eval_obj.as_object().unwrap().get(js_string!("value"), &mut ctx).unwrap();
@@ -1229,7 +1229,7 @@ mod tests {
             .call(&JsValue::undefined(), &[contract_arg], &mut ctx)
             .unwrap();
 
-        let buf = bytes_from_value(res, &mut ctx).unwrap();
+        let buf = bytes_from_value(res, true, &mut ctx).unwrap();
         assert_eq!(buf, contract.input);
     }
 
@@ -1256,7 +1256,7 @@ mod tests {
         {
             let (db, guard) = EvmDbRef::new(&state, &db);
             let addr = Address::default();
-            let addr = JsValue::from(js_string!(addr.to_string()));
+            let addr = address_to_uint8_array_value(addr, &mut context).unwrap();
             let db = db.into_js_object(&mut context).unwrap();
             let res = f.call(&result, &[db.clone().into(), addr.clone()], &mut context).unwrap();
             assert!(!res.as_boolean().unwrap());
@@ -1271,7 +1271,7 @@ mod tests {
 
         {
             let (db, guard) = EvmDbRef::new(&state, &db);
-            let addr = JsValue::from(js_string!(addr.to_string()));
+            let addr = address_to_uint8_array_value(addr, &mut context).unwrap();
             let db = db.into_js_object(&mut context).unwrap();
             let res = f.call(&result, &[db.clone().into(), addr.clone()], &mut context).unwrap();
 
@@ -1315,7 +1315,7 @@ mod tests {
             assert!(obj.get(js_string!("db"), &mut context).unwrap().is_object());
 
             let addr = Address::default();
-            let addr = JsValue::from(js_string!(addr.to_string()));
+            let addr = address_to_uint8_array_value(addr, &mut context).unwrap();
             let res = result_fn
                 .call(&(obj.clone().into()), core::slice::from_ref(&addr), &mut context)
                 .unwrap();
