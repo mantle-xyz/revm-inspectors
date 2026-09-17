@@ -415,6 +415,16 @@ impl JsInspector {
         self.call_stack.pop();
     }
 
+    /// The transaction-level refund accumulated by the frames enclosing the one about to begin.
+    fn refund_for_child(&self) -> u64 {
+        self.call_stack.last().map_or(0, |c| c.enclosing_refund + c.own_refund)
+    }
+
+    /// The refund of the frames enclosing the active one.
+    fn enclosing_refund(&self) -> u64 {
+        self.call_stack.last().map_or(0, |c| c.enclosing_refund)
+    }
+
     /// Returns true whether the active call is the root call.
     #[inline]
     fn is_root_call_active(&self) -> bool {
@@ -443,10 +453,14 @@ impl JsInspector {
         caller: Address,
         gas_limit: u64,
     ) -> &CallStackItem {
+        // Read before pushing: this is the enclosing frames' total, not the new frame's.
+        let enclosing_refund = self.refund_for_child();
         let call = CallStackItem {
             contract: Contract { caller, contract, value, input },
             kind,
             gas_limit,
+            enclosing_refund,
+            own_refund: 0,
         };
         self.call_stack.push(call);
         self.active_call()
@@ -475,6 +489,11 @@ where
         // when the tracer has no `step` hook, which is what geth does.
         self.last_start_step_pc = Some(interp.bytecode.pc());
         self.last_start_step_op = Some(interp.bytecode.opcode());
+        // Recorded unconditionally too: a child frame begins in `call`, where the interpreter is
+        // out of reach, so its snapshot has to come from the value last seen here.
+        if let Some(frame) = self.call_stack.last_mut() {
+            frame.own_refund = interp.gas.refunded().max(0) as u64;
+        }
 
         if self.step_fn.is_none() {
             return;
@@ -497,7 +516,7 @@ where
             pc: interp.bytecode.pc() as u64,
             gas_remaining: interp.gas.remaining(),
             depth: context.journal_ref().depth() as u64,
-            refund: refunded_gas(interp),
+            refund: refunded_gas(interp, self.enclosing_refund()),
             contract: Contract {
                 caller: interp.input.caller_address,
                 contract: interp.input.target_address,
@@ -562,7 +581,7 @@ where
             pc: self.last_start_step_pc.unwrap_or_default() as u64,
             gas_remaining: interp.gas.remaining(),
             depth: context.journal_ref().depth() as u64,
-            refund: refunded_gas(interp),
+            refund: refunded_gas(interp, self.enclosing_refund()),
             contract: Contract {
                 caller: interp.input.caller_address,
                 contract: interp.input.target_address,
@@ -730,6 +749,14 @@ struct CallStackItem {
     contract: Contract,
     kind: CallKind,
     gas_limit: u64,
+    /// The refund counter of every enclosing frame at the moment this one began.
+    ///
+    /// revm keeps the counter per frame and merges a child into its parent only once the child
+    /// returns successfully, so a frame in progress sees only its own refunds. go-ethereum keeps
+    /// one counter for the whole transaction. Adding this snapshot back reproduces its view.
+    enclosing_refund: u64,
+    /// This frame's own refund as of the last instruction, used to seed a child's snapshot.
+    own_refund: u64,
 }
 
 /// Error variants that can occur during JavaScript inspection.
@@ -843,8 +870,8 @@ const fn is_fault(result: InstructionResult) -> bool {
 /// Returns the interpreter's refund counter as an unsigned value, clamping the negative values
 /// `Gas::refunded` reports when a storage clear is reversed. Scope still differs from geth's
 /// transaction-wide `StateDB.GetRefund()`; aligning needs the journal's transaction-level counter.
-fn refunded_gas(interp: &Interpreter) -> u64 {
-    interp.gas.refunded().max(0) as u64
+fn refunded_gas(interp: &Interpreter, enclosing: u64) -> u64 {
+    enclosing.saturating_add(interp.gas.refunded().max(0) as u64)
 }
 
 /// Converts a JavaScript error into a [InstructionResult::Revert] [InterpreterResult].
@@ -1960,6 +1987,89 @@ mod tests {
         }"#;
         let res = run_trace(code, Some(Bytes::from(program.to_vec())), true);
         assert_eq!(res, json!("170"));
+    }
+
+    /// `getRefund()` reports the refund of the whole transaction, not of the active frame.
+    ///
+    /// revm keeps the counter per frame and merges a child into its parent only when the child
+    /// returns successfully, so a frame in progress sees only its own refunds; go-ethereum keeps
+    /// one counter on the state and every frame reads the same running total.
+    #[test]
+    fn test_get_refund_is_transaction_wide() {
+        // Clears a pre-set storage slot, which is what earns the refund.
+        const CLEAR: [u8; 5] = hex!("6000600055");
+
+        /// Runs `outer` calling `inner`, reporting the refund at each frame's last instruction.
+        fn refunds(inner_reverts: bool) -> serde_json::Value {
+            let outer_addr = Address::repeat_byte(0x01);
+            let inner_addr = Address::repeat_byte(0x02);
+
+            let mut outer = CLEAR.to_vec();
+            // retLen, retOff, argLen, argOff, value, then the callee and the gas.
+            outer.extend_from_slice(&hex!("60006000600060006000"));
+            outer.push(0x73);
+            outer.extend_from_slice(inner_addr.as_slice());
+            outer.extend_from_slice(&hex!("61fffff15000")); // PUSH2 gas, CALL, POP, STOP
+
+            let mut inner = CLEAR.to_vec();
+            if inner_reverts {
+                inner.extend_from_slice(&hex!("60006000fd")); // PUSH1 0, PUSH1 0, REVERT
+            } else {
+                inner.push(0x00); // STOP
+            }
+
+            let mut db = CacheDB::new(EmptyDB::default());
+            db.insert_account_info(
+                Address::ZERO,
+                AccountInfo { balance: U256::from(1e18), ..Default::default() },
+            );
+            for (addr, code) in [(outer_addr, outer), (inner_addr, inner)] {
+                db.insert_account_info(
+                    addr,
+                    AccountInfo {
+                        code: Some(Bytecode::new_legacy(code.into())),
+                        ..Default::default()
+                    },
+                );
+                db.insert_account_storage(addr, U256::ZERO, U256::from(1)).unwrap();
+            }
+
+            let code = r#"{
+                seen: [],
+                fault: function() {},
+                step: function(log) {
+                    var op = log.op.toString();
+                    if (op === "STOP" || op === "REVERT") {
+                        this.seen.push(log.getDepth() + ":" + log.getRefund());
+                    }
+                },
+                result: function() { return this.seen.join(" ") }
+            }"#;
+            let insp = JsInspector::new(code.to_string(), serde_json::Value::Null).unwrap();
+            let mut evm = revm::Context::mainnet()
+                .modify_cfg_chained(|cfg| cfg.spec = SpecId::CANCUN)
+                .with_db(db)
+                .build_mainnet_with_inspector(insp);
+            let res = evm
+                .inspect_tx(TxEnv {
+                    gas_limit: 1_000_000,
+                    kind: TransactTo::Call(outer_addr),
+                    ..Default::default()
+                })
+                .unwrap();
+            let (ctx, inspector) = evm.ctx_inspector();
+            inspector.json_result(res, ctx.tx(), ctx.block(), ctx.db_ref()).unwrap()
+        }
+
+        // Each cleared slot is worth 4800 under Cancun. The inner frame must see both its own
+        // refund and the outer one's, and the outer frame the merged total afterwards.
+        assert_eq!(refunds(false), json!("2:9600 1:9600"));
+
+        // A reverting child has its refund discarded: revm zeroes it and skips the merge, and
+        // go-ethereum rolls the counter back through the journal. Either way the outer frame is
+        // left with only its own 4800, while the child still saw the running total before it
+        // failed.
+        assert_eq!(refunds(true), json!("2:9600 1:4800"));
     }
 
     /// `getUint` reads 32 bytes as a number, as geth's `memoryObj.GetUint` does.
