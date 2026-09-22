@@ -176,3 +176,213 @@ fn test_geth_jstracer_proxy_contract() {
     let result = insp.json_result(res, context.tx(), context.block(), context.db_ref()).unwrap();
     assert_eq!(result, json!([{"event": "Transfer", "token": proxy_addr, "caller": deployer}]));
 }
+
+/// Reports what installing the `bigInt` environment costs per tracer instance, which
+/// `debug_traceBlockByNumber` pays once per transaction. Run with
+/// `cargo test --release --all-features -- --ignored --nocapture`.
+#[test]
+#[ignore = "benchmark, run explicitly with --ignored"]
+fn bench_bigint_install_cost() {
+    use boa_engine::{Context, Source};
+    use std::time::Instant;
+
+    const N: u32 = 200;
+    // The 5-line shim that stood in for the library before this change.
+    const NATIVE_SHIM: &str = r#"
+BigInt.prototype.toJSON = function() { return this.toString(); };
+BigInt.prototype.equals = function(other) { return this == other; };
+BigInt.prototype.toJSNumber = function() { return Number(this); };
+BigInt.prototype.plus = function(other) { return this + BigInt(other); };
+BigInt.prototype.minus = function(other) { return this - BigInt(other); };
+"#;
+    const BIG_INT_JS: &str = include_str!("../../src/tracing/js/bigint.js");
+    const NOOP_TRACER: &str =
+        "{ step: function() {}, fault: function() {}, result: function() { return {}; } }";
+
+    fn time(label: &str, baseline: Option<f64>, mut f: impl FnMut()) -> f64 {
+        for _ in 0..10 {
+            f();
+        }
+        let start = Instant::now();
+        for _ in 0..N {
+            f();
+        }
+        let per = start.elapsed().as_secs_f64() * 1e6 / f64::from(N);
+        match baseline {
+            Some(b) => println!("{label:<34} {per:>8.1} us  ({:.2}x baseline)", per / b),
+            None => println!("{label:<34} {per:>8.1} us  (baseline)"),
+        }
+        per
+    }
+
+    // A tracer that only counts opcodes - never touches a big integer, so the lazy
+    // installation should never fire for it.
+    const COUNTING_TRACER: &str = "{ count: 0, step: function() { this.count++; }, \
+         fault: function() {}, result: function() { return this.count; } }";
+
+    let base = time("Context::default()", None, || {
+        let _ = Context::default();
+    });
+
+    println!("\n-- per JsInspector instance (one per traced transaction) --");
+    time("native shim only (before change)", Some(base), || {
+        let mut ctx = Context::default();
+        ctx.eval(Source::from_bytes(NATIVE_SHIM)).unwrap();
+    });
+    time("lazy install, no bigInt use", Some(base), || {
+        let _ = JsInspector::new(COUNTING_TRACER.to_string(), serde_json::Value::Null).unwrap();
+    });
+    time("lazy install, noop tracer", Some(base), || {
+        let _ = JsInspector::new(NOOP_TRACER.to_string(), serde_json::Value::Null).unwrap();
+    });
+
+    println!("\n-- one-off cost when a tracer first touches bigInt --");
+    time("eager install (what lazy defers)", Some(base), || {
+        let mut ctx = Context::default();
+        ctx.eval(Source::from_bytes(BIG_INT_JS)).unwrap();
+        ctx.eval(Source::from_bytes(NATIVE_SHIM)).unwrap();
+    });
+    // Decomposition: the library builds a cache of 1999 small integers at load time. Trimming
+    // it would break byte-identity with geth, so this only quantifies what that would buy.
+    let trimmed = BIG_INT_JS.replace("i<1e3", "i<2");
+    assert_ne!(trimmed, BIG_INT_JS, "init-loop pattern not found");
+    time("  of which parse+compile", Some(base), || {
+        let mut ctx = Context::default();
+        ctx.eval(Source::from_bytes(trimmed.as_str())).unwrap();
+    });
+}
+
+/// The `bigInt` global must take a radix and expose the canonical BigInteger.js arithmetic
+/// names, as `prestate_tracer_legacy.js` does; reproduced rather than copied, as geth's
+/// tracers are LGPL. A native `BigInt` throws on the hex literal below, ignoring the radix.
+#[test]
+fn test_geth_jstracer_bigint_radix_and_arithmetic() {
+    let deployer = Address::ZERO;
+
+    let evm = Context::mainnet()
+        .with_db(CacheDB::new(EmptyDB::default()))
+        .modify_cfg_chained(|cfg| cfg.spec = SpecId::CANCUN)
+        .build_mainnet();
+
+    let code = r#"
+{
+    fault: function() {},
+    step: function() {},
+    result: function() {
+        var bal = bigInt("0de0b6b3a7640000", 16);
+        return {
+            radix:    bal.toString(),
+            hex:      bal.toString(16),
+            subtract: bal.subtract(1).toString(),
+            add:      bal.add(1).toString(),
+        };
+    }
+}"#;
+
+    let insp = JsInspector::new(code.to_string(), serde_json::Value::Null).unwrap();
+    let mut evm = evm.with_inspector(insp);
+    let res = evm
+        .inspect_tx(TxEnv {
+            caller: deployer,
+            gas_limit: 1000000,
+            kind: TransactTo::Call(Address::ZERO),
+            ..Default::default()
+        })
+        .unwrap();
+
+    let (context, insp) = evm.ctx_inspector();
+    let result = insp.json_result(res, context.tx(), context.block(), context.db_ref()).unwrap();
+
+    assert_eq!(
+        result,
+        json!({
+            "radix": "1000000000000000000",
+            "hex": "de0b6b3a7640000",
+            "subtract": "999999999999999999",
+            "add": "1000000000000000001",
+        })
+    );
+}
+
+/// `.valueOf()` must yield a plain JS number, so it mixes with number literals and serializes
+/// as a JSON number. Mirrors `4byte_tracer_legacy.js` (`memory.slice(inOff, inOff + 4)`) and
+/// `call_tracer_legacy.js` (`outOff`/`outLen` as JSON numbers); reproduced, as both are LGPL.
+#[test]
+fn test_geth_jstracer_valueof_number_semantics() {
+    // Same Token/Proxy pair as `test_geth_jstracer_proxy_contract`; the proxy performs a
+    // DELEGATECALL, whose stack layout is gas, addr, memin, meminsz, memout, memoutsz.
+    let token_code = hex!("6080604052348015600e575f80fd5b5060dd80601a5f395ff3fe608060405260043610601b575f3560e01c8063a9059cbb14601f575b5f80fd5b602e602a3660046074565b6030565b005b6040518181526001600160a01b0383169033907fddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef9060200160405180910390a35050565b5f80604083850312156084575f80fd5b82356001600160a01b03811681146099575f80fd5b94602093909301359350505056fea2646970667358221220d81408f997c5f148e7d6afc66ccc7cda17a38396925363f11993fa885b70729b64736f6c63430008190033");
+    let proxy_code = hex!("6080604052348015600e575f80fd5b506101998061001c5f395ff3fe60806040526004361061001d575f3560e01c80631a69523014610021575b5f80fd5b61003461002f366004610120565b610036565b005b6040516104006024820152606560448201525f9081906001600160a01b0384169060640160408051601f198184030181529181526020820180516001600160e01b031663a9059cbb60e01b1790525161008f919061014d565b5f60405180830381855af49150503d805f81146100c7576040519150601f19603f3d011682016040523d82523d5f602084013e6100cc565b606091505b50915091508161011b5760405162461bcd60e51b815260206004820152601660248201527519985a5b1959081d1bc819195b1959d85d1958d85b1b60521b604482015260640160405180910390fd5b505050565b5f60208284031215610130575f80fd5b81356001600160a01b0381168114610146575f80fd5b9392505050565b5f82518060208501845e5f92019182525091905056fea2646970667358221220d7855999519e998c7bcef0432918ca2f5b00228a4058ba259260e327013226f764736f6c63430008190033");
+
+    let deployer = address!("f077b491b355e64048ce21e3a6fc4751eeea77fa");
+
+    let mut evm = Context::mainnet()
+        .with_db(CacheDB::new(EmptyDB::default()))
+        .modify_cfg_chained(|cfg| cfg.spec = SpecId::CANCUN)
+        .build_mainnet();
+
+    let token_addr =
+        deploy_contract(&mut evm, token_code.into(), Address::default(), SpecId::CANCUN)
+            .created_address()
+            .unwrap();
+    let proxy_addr = deploy_contract(&mut evm, proxy_code.into(), Address::ZERO, SpecId::CANCUN)
+        .created_address()
+        .unwrap();
+
+    let mut input_data = hex!("1a695230").to_vec();
+    input_data.extend_from_slice(&[0u8; 12]);
+    input_data.extend_from_slice(token_addr.as_slice());
+
+    let code = r#"
+{
+    selector: null,
+    inOff: null,
+    inSz: null,
+    fault: function() {},
+    step: function(log) {
+        if (this.selector !== null) {
+            return;
+        }
+        if (log.op.toString() === "DELEGATECALL") {
+            var inOff = log.stack.peek(2).valueOf();
+            var inSz  = log.stack.peek(3).valueOf();
+            // Mixing the unwrapped value with a number literal must not throw.
+            this.selector = toHex(log.memory.slice(inOff, inOff + 4));
+            this.inOff = inOff;
+            this.inSz = inSz;
+        }
+    },
+    result: function() {
+        return { selector: this.selector, inOff: this.inOff, inSz: this.inSz };
+    }
+}"#;
+
+    let insp = JsInspector::new(code.to_string(), serde_json::Value::Null).unwrap();
+    let mut evm = evm.with_inspector(insp);
+    let res = evm
+        .inspect_tx(TxEnv {
+            caller: deployer,
+            gas_limit: 1000000,
+            kind: TransactTo::Call(proxy_addr),
+            data: input_data.into(),
+            ..Default::default()
+        })
+        .unwrap();
+    // A throw inside `step` halts the interpreter with `Revert` (see `JsInspector::step`), so a
+    // tracer that cannot do `inOff + 4` makes the traced transaction look like it reverted.
+    assert!(
+        res.result.is_success(),
+        "tracer step threw, reverting the traced tx: {:?}",
+        res.result
+    );
+
+    let (context, insp) = evm.ctx_inspector();
+    let result = insp.json_result(res, context.tx(), context.block(), context.db_ref()).unwrap();
+
+    // `transfer(address,uint256)` is what the proxy encodes before delegatecalling.
+    assert_eq!(result["selector"], json!("0xa9059cbb"));
+    // geth emits these as JSON numbers, not strings.
+    assert!(result["inOff"].is_number(), "inOff should be a JSON number, got {}", result["inOff"]);
+    assert!(result["inSz"].is_number(), "inSz should be a JSON number, got {}", result["inSz"]);
+    assert_eq!(result["inSz"], json!(68));
+}

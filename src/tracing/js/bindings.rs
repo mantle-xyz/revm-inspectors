@@ -19,7 +19,8 @@ use boa_engine::{
     js_string,
     native_function::NativeFunction,
     object::{builtins::JsUint8Array, FunctionObjectBuilder},
-    Context, JsArgs, JsError, JsNativeError, JsObject, JsResult, JsValue,
+    property::PropertyDescriptor,
+    Context, JsArgs, JsError, JsNativeError, JsObject, JsResult, JsString, JsValue,
 };
 use boa_gc::{empty_trace, Finalize, Trace};
 use core::cell::RefCell;
@@ -660,6 +661,41 @@ impl CallFrame {
     }
 }
 
+/// Defines `name` on `obj` as a big integer materialised on first read, since converting
+/// eagerly would evaluate the whole `bigInt` library per `result()` call. The accessor then
+/// becomes a writable data property, like the plain property go-ethereum exposes.
+fn define_lazy_bigint(
+    obj: &JsObject,
+    name: &'static str,
+    value: U256,
+    ctx: &mut Context,
+) -> JsResult<()> {
+    let getter = NativeFunction::from_copy_closure(move |this, _args, ctx| {
+        let big_int = to_bigint(value, ctx)?;
+        if let Some(this) = this.as_object() {
+            this.define_property_or_throw(
+                JsString::from(name),
+                PropertyDescriptor::builder()
+                    .value(big_int.clone())
+                    .writable(true)
+                    .enumerable(true)
+                    .configurable(true)
+                    .build(),
+                ctx,
+            )?;
+        }
+        Ok(big_int)
+    })
+    .to_js_function(ctx.realm());
+
+    obj.define_property_or_throw(
+        JsString::from(name),
+        PropertyDescriptor::builder().get(getter).enumerable(true).configurable(true).build(),
+        ctx,
+    )?;
+    Ok(())
+}
+
 /// The `ctx` object that represents the context in which the transaction is executed.
 pub(crate) struct JsEvmContext {
     /// String, one of the two values CALL and CREATE
@@ -727,7 +763,7 @@ impl JsEvmContext {
         obj.set(js_string!("gasUsed"), gas_used, false, ctx)?;
         obj.set(js_string!("gasPrice"), gas_price, false, ctx)?;
         obj.set(js_string!("intrinsicGas"), intrinsic_gas, false, ctx)?;
-        obj.set(js_string!("value"), to_bigint(value, ctx)?, false, ctx)?;
+        define_lazy_bigint(&obj, "value", value, ctx)?;
         obj.set(js_string!("block"), block, false, ctx)?;
         obj.set(js_string!("coinbase"), address_to_uint8_array(coinbase, ctx)?, false, ctx)?;
         obj.set(js_string!("output"), to_uint8_array(output, ctx)?, false, ctx)?;
