@@ -92,6 +92,10 @@ pub struct JsInspector {
     last_start_step_pc: Option<usize>,
     /// Tracks gas spent in the previous step to calculate individual opcode cost
     previous_gas_spent: u64,
+    /// The first error thrown by one of the tracer's hooks, if any. Mirrors go-ethereum's
+    /// `jsTracer.err`: once a hook throws the rest are skipped and [`Self::result`] reports
+    /// the error instead of a silently incomplete trace.
+    hook_error: Option<JsInspectorError>,
 }
 
 impl JsInspector {
@@ -195,6 +199,7 @@ impl JsInspector {
             precompiles_registered: false,
             last_start_step_pc: None,
             previous_gas_spent: 0,
+            hook_error: None,
         })
     }
 
@@ -266,6 +271,13 @@ impl JsInspector {
         DB: DatabaseRef,
         <DB as DatabaseRef>::Error: core::fmt::Display,
     {
+        // A hook that threw leaves the tracer's state half-built, so report the failure
+        // instead of a trace that silently omits whatever the hook did not record. The error
+        // is rebuilt rather than taken, so asking for the result twice answers the same way.
+        if let Some(JsInspectorError::HookFailed { hook, source }) = &self.hook_error {
+            return Err(JsInspectorError::HookFailed { hook, source: source.clone() });
+        }
+
         let ResultAndState { result, state } = res;
         let (db, _db_guard) = EvmDbRef::new(&state, db);
 
@@ -307,10 +319,7 @@ impl JsInspector {
             input: tx.input().clone(),
             gas: tx.gas_limit(),
             gas_used,
-            gas_price: tx
-                .effective_gas_price(block.basefee() as u128)
-                .try_into()
-                .unwrap_or(u64::MAX),
+            gas_price: U256::from(effective_gas_tip(tx, block.basefee() as u128)),
             value: tx.value(),
             block: block.number().try_into().unwrap_or(u64::MAX),
             coinbase: block.beneficiary(),
@@ -329,7 +338,24 @@ impl JsInspector {
         )?)
     }
 
+    /// Records the first error thrown by a tracer hook, tagged with the hook's name.
+    ///
+    /// Later errors are dropped: the first one is the one that explains the rest.
+    fn record_hook_error(&mut self, hook: &'static str, err: JsError) {
+        if self.hook_error.is_none() {
+            self.hook_error = Some(JsInspectorError::HookFailed { hook, source: err });
+        }
+    }
+
+    /// Whether a hook has already thrown, in which case the remaining hooks are skipped.
+    const fn hook_errored(&self) -> bool {
+        self.hook_error.is_some()
+    }
+
     fn try_fault(&mut self, step: StepLog, db: EvmDbRef) -> JsResult<()> {
+        if self.hook_errored() {
+            return Ok(());
+        }
         let step = step.into_js_object(&mut self.ctx)?;
         let db = db.into_js_object(&mut self.ctx)?;
         self.fault_fn.call(&(self.obj.clone().into()), &[step.into(), db.into()], &mut self.ctx)?;
@@ -337,6 +363,9 @@ impl JsInspector {
     }
 
     fn try_step(&mut self, step: StepLog, db: EvmDbRef) -> JsResult<()> {
+        if self.hook_errored() {
+            return Ok(());
+        }
         if let Some(step_fn) = &self.step_fn {
             let step = step.into_js_object(&mut self.ctx)?;
             let db = db.into_js_object(&mut self.ctx)?;
@@ -346,6 +375,9 @@ impl JsInspector {
     }
 
     fn try_enter(&mut self, frame: CallFrame) -> JsResult<()> {
+        if self.hook_errored() {
+            return Ok(());
+        }
         if let Some(enter_fn) = &self.enter_fn {
             let frame = frame.into_js_object(&mut self.ctx)?;
             enter_fn.call(&(self.obj.clone().into()), &[frame.into()], &mut self.ctx)?;
@@ -354,6 +386,9 @@ impl JsInspector {
     }
 
     fn try_exit(&mut self, frame: FrameResult) -> JsResult<()> {
+        if self.hook_errored() {
+            return Ok(());
+        }
         if let Some(exit_fn) = &self.exit_fn {
             let frame = frame.into_js_object(&mut self.ctx)?;
             exit_fn.call(&(self.obj.clone().into()), &[frame.into()], &mut self.ctx)?;
@@ -466,7 +501,8 @@ where
 
         self.set_previous_gas_spent(gas_spent);
 
-        if self.try_step(step, db).is_err() {
+        if let Err(err) = self.try_step(step, db) {
+            self.record_hook_error("step", err);
             interp
                 .bytecode
                 .set_action(InterpreterAction::new_halt(InstructionResult::Revert, interp.gas));
@@ -517,7 +553,9 @@ where
                 },
             };
 
-            let _ = self.try_fault(step, db);
+            if let Err(err) = self.try_fault(step, db) {
+                self.record_hook_error("fault", err);
+            }
         }
     }
 
@@ -550,6 +588,7 @@ where
                 gas: inputs.gas_limit,
             };
             if let Err(err) = self.try_enter(frame) {
+                self.record_hook_error("enter", err.clone());
                 return Some(CallOutcome::new(
                     js_error_to_revert(err),
                     inputs.return_memory_offset.clone(),
@@ -568,6 +607,7 @@ where
                 error: utils::fmt_error_msg(outcome.result.result, TraceStyle::Geth),
             };
             if let Err(err) = self.try_exit(frame_result) {
+                self.record_hook_error("exit", err.clone());
                 outcome.result = js_error_to_revert(err);
             }
         }
@@ -594,6 +634,7 @@ where
             let frame =
                 CallFrame { contract: call.contract.clone(), kind: call.kind, gas: call.gas_limit };
             if let Err(err) = self.try_enter(frame) {
+                self.record_hook_error("enter", err.clone());
                 return Some(CreateOutcome::new(js_error_to_revert(err), None));
             }
         }
@@ -614,6 +655,7 @@ where
                 error: None,
             };
             if let Err(err) = self.try_exit(frame_result) {
+                self.record_hook_error("exit", err.clone());
                 outcome.result = js_error_to_revert(err);
             }
         }
@@ -628,13 +670,17 @@ where
             let call = self.active_call();
             let frame =
                 CallFrame { contract: call.contract.clone(), kind: call.kind, gas: call.gas_limit };
-            let _ = self.try_enter(frame);
+            if let Err(err) = self.try_enter(frame) {
+                self.record_hook_error("enter", err);
+            }
         }
 
         // exit with empty frame result ref <https://github.com/ethereum/go-ethereum/blob/0004c6b229b787281760b14fb9460ffd9c2496f1/core/vm/instructions.go#L829-L829>
         if self.exit_fn.is_some() {
             let frame_result = FrameResult { gas_used: 0, output: Bytes::new(), error: None };
-            let _ = self.try_exit(frame_result);
+            if let Err(err) = self.try_exit(frame_result) {
+                self.record_hook_error("exit", err);
+            }
         }
     }
 }
@@ -657,6 +703,17 @@ pub enum JsInspectorError {
     /// Failure during the evaluation of JavaScript code.
     #[error("failed to evaluate JS code: {0}")]
     EvalCode(JsError),
+
+    /// One of the tracer's hooks threw, so the trace is abandoned rather than returned
+    /// half-built. go-ethereum likewise records the first hook error and returns it from
+    /// `GetResult()`.
+    #[error("{source}    in server-side tracer function '{hook}'")]
+    HookFailed {
+        /// The hook that threw: `step`, `fault`, `enter` or `exit`.
+        hook: &'static str,
+        /// The underlying JavaScript error.
+        source: JsError,
+    },
 
     /// The evaluated code is not a JavaScript object.
     #[error("the evaluated code is not a JS object")]
@@ -688,6 +745,26 @@ pub enum JsInspectorError {
 fn js_error_to_revert(err: JsError) -> InterpreterResult {
     let output = err.to_string().as_bytes().to_vec();
     InterpreterResult { result: InstructionResult::Revert, output: output.into(), gas: Gas::new(0) }
+}
+
+/// Returns `min(gasTipCap, gasFeeCap - baseFee)`, what go-ethereum surfaces to a tracer as
+/// `ctx.gasPrice`. It is the tip alone, so it is *less* than the sender paid per unit of gas.
+/// Legacy and EIP-2930 transactions have no separate tip cap; geth uses their gas price as both.
+fn effective_gas_tip(tx: &impl Transaction, base_fee: u128) -> u128 {
+    let fee_cap = tx.max_fee_per_gas();
+    effective_gas_tip_from(fee_cap, tx.max_priority_fee_per_gas().unwrap_or(fee_cap), base_fee)
+}
+
+/// The arithmetic behind [`effective_gas_tip`], split out so it can be tested directly.
+fn effective_gas_tip_from(fee_cap: u128, tip_cap: u128, base_fee: u128) -> u128 {
+    if fee_cap < base_fee {
+        // Reproducing a quirk, not an oversight: geth subtracts in `uint256`, so this wraps to
+        // a huge value, the `min` below always picks the tip cap, and `OnTxStart` discards the
+        // `ErrGasFeeCapTooLow` that comes with it. Only reachable via `debug_traceCall`.
+        tip_cap
+    } else {
+        tip_cap.min(fee_cap - base_fee)
+    }
 }
 
 #[cfg(test)]
@@ -736,6 +813,15 @@ mod tests {
 
     // Helper function to run a trace and return the result
     fn run_trace(code: &str, contract: Option<Bytes>, success: bool) -> serde_json::Value {
+        try_run_trace(code, contract, success).expect("tracer should not fail")
+    }
+
+    /// Like [`run_trace`], but surfaces a tracer failure instead of panicking on it.
+    fn try_run_trace(
+        code: &str,
+        contract: Option<Bytes>,
+        success: bool,
+    ) -> Result<serde_json::Value, JsInspectorError> {
         let addr = Address::repeat_byte(0x01);
         let mut db = CacheDB::new(EmptyDB::default());
 
@@ -775,7 +861,102 @@ mod tests {
 
         assert_eq!(res.result.is_success(), success);
         let (ctx, inspector) = evm.ctx_inspector();
-        inspector.json_result(res, ctx.tx(), ctx.block(), ctx.db_ref()).unwrap()
+        inspector.json_result(res, ctx.tx(), ctx.block(), ctx.db_ref())
+    }
+
+    /// Asserts that a throwing `step` hook fails the whole trace, naming the hook. geth does
+    /// the same: out-of-range accessors call `vm.Interrupt`, the error lands in
+    /// `jsTracer.err`, and `GetResult()` returns it rather than a partial trace.
+    fn assert_step_hook_fails(code: &str, contract: Option<Bytes>) {
+        let err = try_run_trace(code, contract, false)
+            .expect_err("a throwing step hook must fail the trace");
+        let msg = err.to_string();
+        assert!(msg.contains("step"), "error should name the failing hook, got: {msg}");
+    }
+
+    /// `ctx.gasPrice` must be the effective *tip* and a big integer, as in go-ethereum. With
+    /// base fee 300 and legacy gas price 1000 the candidates are far apart: geth reports
+    /// `min(1000, 1000 - 300) = 700`, the price the sender actually pays is the full 1000.
+    #[test]
+    fn test_ctx_gas_price_is_effective_tip() {
+        let addr = Address::repeat_byte(0x01);
+        let mut db = CacheDB::new(EmptyDB::default());
+        db.insert_account_info(
+            Address::ZERO,
+            AccountInfo { balance: U256::from(1e18), ..Default::default() },
+        );
+        db.insert_account_info(
+            addr,
+            AccountInfo {
+                code: Some(Bytecode::new_legacy(hex!("6001600100").into())),
+                ..Default::default()
+            },
+        );
+
+        let code = r#"{
+            step: function() {},
+            fault: function() {},
+            result: function(ctx) {
+                return { price: ctx.gasPrice.toString(), kind: typeof ctx.gasPrice };
+            }
+        }"#;
+        let insp = JsInspector::new(code.to_string(), serde_json::Value::Null).unwrap();
+
+        let mut evm = revm::Context::mainnet()
+            .modify_cfg_chained(|cfg| cfg.spec = SpecId::CANCUN)
+            .modify_block_chained(|block| block.basefee = 300)
+            .with_db(db)
+            .build_mainnet_with_inspector(insp);
+
+        let res = evm
+            .inspect_tx(TxEnv {
+                gas_price: 1000,
+                gas_limit: 1_000_000,
+                gas_priority_fee: None,
+                kind: TransactTo::Call(addr),
+                ..Default::default()
+            })
+            .expect("pass without error");
+
+        let (ctx, inspector) = evm.ctx_inspector();
+        let res = inspector.json_result(res, ctx.tx(), ctx.block(), ctx.db_ref()).unwrap();
+
+        assert_eq!(res["price"], json!("700"), "gasPrice must exclude the base fee");
+        assert_eq!(res["kind"], json!("object"), "gasPrice must be a bigInt, not a JS number");
+    }
+
+    /// When the fee cap is below the base fee geth reports the full tip cap, because its
+    /// `uint256` subtraction wraps. Saturating to zero is the intuitive reading and the one
+    /// that diverges. Reachable via `debug_traceCall`, which does not enforce the base fee.
+    #[test]
+    fn test_effective_gas_tip_below_base_fee_matches_geth() {
+        // (fee cap, tip cap, base fee) -> expected tip
+        assert_eq!(effective_gas_tip_from(100, 50, 300), 50, "fee cap under base fee: tip cap");
+        assert_eq!(effective_gas_tip_from(1000, 50, 300), 50, "tip cap binds");
+        assert_eq!(effective_gas_tip_from(1000, 900, 300), 700, "headroom binds");
+        // Legacy and EIP-2930: the gas price stands in for both caps.
+        assert_eq!(effective_gas_tip_from(1000, 1000, 300), 700, "legacy");
+        assert_eq!(effective_gas_tip_from(0, 0, 0), 0, "zero-priced transaction");
+    }
+
+    /// The lazily-defined `ctx` fields must be indistinguishable from ordinary properties:
+    /// geth assigns them directly, so reading one twice gives the same object and assigning
+    /// sticks. The deferring accessor has to replace itself on first read to preserve both.
+    #[test]
+    fn test_ctx_lazy_fields_behave_as_plain_properties() {
+        let code = r#"{
+            step: function() {},
+            fault: function() {},
+            result: function(ctx) {
+                var same = ctx.value === ctx.value;
+                ctx.value = 42;
+                return { same: same, assigned: ctx.value, price: ctx.gasPrice === ctx.gasPrice };
+            }
+        }"#;
+        let res = run_trace(code, None, true);
+        assert_eq!(res["same"], json!(true), "reading twice must yield the same object");
+        assert_eq!(res["assigned"], json!(42), "the field must be writable");
+        assert_eq!(res["price"], json!(true), "gasPrice must memoize too");
     }
 
     #[test]
@@ -798,8 +979,7 @@ mod tests {
             fault: function() {},
             result: function() { return this.depths; }
         }"#;
-        let res = run_trace(code, None, false);
-        assert_eq!(res.as_array().unwrap().len(), 0);
+        assert_step_hook_fails(code, None);
     }
 
     #[test]
@@ -810,8 +990,7 @@ mod tests {
             fault: function() {},
             result: function() { return this.depths; }
         }"#;
-        let res = run_trace(code, None, false);
-        assert_eq!(res.as_array().unwrap().len(), 0);
+        assert_step_hook_fails(code, None);
     }
 
     #[test]
@@ -822,8 +1001,7 @@ mod tests {
             fault: function() {},
             result: function() { return this.depths; }
         }"#;
-        let res = run_trace(code, None, false);
-        assert_eq!(res.as_array().unwrap().len(), 0);
+        assert_step_hook_fails(code, None);
     }
 
     #[test]
@@ -932,8 +1110,7 @@ mod tests {
             result: function() { return this.res }
         }"#;
         let contract = hex!("60ff60005300"); // PUSH1, 0xff, PUSH1, 0x00, MSTORE8, STOP
-        let res = run_trace(code, Some(contract.into()), false);
-        assert_eq!(res, json!([]));
+        assert_step_hook_fails(code, Some(contract.into()));
     }
 
     #[test]
@@ -944,8 +1121,7 @@ mod tests {
             fault: function() {},
             result: function() { return this.res }
         }"#;
-        let res = run_trace(code, None, false);
-        assert_eq!(res, json!([]));
+        assert_step_hook_fails(code, None);
     }
 
     #[test]

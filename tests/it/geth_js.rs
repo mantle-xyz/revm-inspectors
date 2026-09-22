@@ -177,6 +177,54 @@ fn test_geth_jstracer_proxy_contract() {
     assert_eq!(result, json!([{"event": "Transfer", "token": proxy_addr, "caller": deployer}]));
 }
 
+/// A throw inside a hook must surface, not be swallowed into a bare revert that looks exactly
+/// like the traced contract reverting. geth records the first hook error in `jsTracer.err` and
+/// returns it from `GetResult()`; we mirror that.
+#[test]
+fn test_geth_jstracer_hook_error_is_reported() {
+    let deployer = Address::ZERO;
+
+    let mut evm = Context::mainnet()
+        .with_db(CacheDB::new(EmptyDB::default()))
+        .modify_cfg_chained(|cfg| cfg.spec = SpecId::CANCUN)
+        .build_mainnet();
+
+    // Deploys the runtime `6001600100` (PUSH1 1, PUSH1 1, STOP) - just enough opcodes for
+    // `step` to run at least once.
+    let deploy = hex!("64600160010060005260056000f3");
+    let addr = deploy_contract(&mut evm, deploy.into(), deployer, SpecId::CANCUN)
+        .created_address()
+        .unwrap();
+
+    let code = r#"
+{
+    fault: function() {},
+    step: function() { throw new Error("boom"); },
+    result: function() { return "unreachable"; }
+}"#;
+
+    let insp = JsInspector::new(code.to_string(), serde_json::Value::Null).unwrap();
+    let mut evm = evm.with_inspector(insp);
+    let res = evm
+        .inspect_tx(TxEnv {
+            caller: deployer,
+            gas_limit: 1000000,
+            kind: TransactTo::Call(addr),
+            nonce: 1,
+            ..Default::default()
+        })
+        .unwrap();
+
+    let (context, insp) = evm.ctx_inspector();
+    let err = insp
+        .json_result(res, context.tx(), context.block(), context.db_ref())
+        .expect_err("a throwing step hook must fail the trace");
+
+    let msg = err.to_string();
+    assert!(msg.contains("boom"), "error should carry the JS message, got: {msg}");
+    assert!(msg.contains("step"), "error should name the failing hook, got: {msg}");
+}
+
 /// Reports what installing the `bigInt` environment costs per tracer instance, which
 /// `debug_traceBlockByNumber` pays once per transaction. Run with
 /// `cargo test --release --all-features -- --ignored --nocapture`.

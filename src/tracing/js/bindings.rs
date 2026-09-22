@@ -709,8 +709,10 @@ pub(crate) struct JsEvmContext {
     pub(crate) gas: u64,
     /// Number, amount of gas used in executing the transaction (excludes txdata costs)
     pub(crate) gas_used: u64,
-    /// Number, gas price configured in the transaction being executed
-    pub(crate) gas_price: u64,
+    /// big.int, the effective gas tip of the transaction being executed. Despite the
+    /// `gasPrice` name this excludes the base fee, matching go-ethereum, whose `OnTxStart`
+    /// assigns `tx.EffectiveGasTip(baseFee)`.
+    pub(crate) gas_price: U256,
     /// Number, intrinsic gas for the transaction being executed
     pub(crate) intrinsic_gas: u64,
     /// big.int Amount to be transferred in wei
@@ -761,7 +763,7 @@ impl JsEvmContext {
         obj.set(js_string!("input"), to_uint8_array(input, ctx)?, false, ctx)?;
         obj.set(js_string!("gas"), gas, false, ctx)?;
         obj.set(js_string!("gasUsed"), gas_used, false, ctx)?;
-        obj.set(js_string!("gasPrice"), gas_price, false, ctx)?;
+        define_lazy_bigint(&obj, "gasPrice", gas_price, ctx)?;
         obj.set(js_string!("intrinsicGas"), intrinsic_gas, false, ctx)?;
         define_lazy_bigint(&obj, "value", value, ctx)?;
         obj.set(js_string!("block"), block, false, ctx)?;
