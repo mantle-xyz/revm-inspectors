@@ -60,17 +60,18 @@ impl MuxInspector {
                     four_byte = Some(FourByteInspector::default());
                 }
                 GethDebugBuiltInTracerType::CallTracer => {
-                    let call_config =
-                        tracer_config.ok_or(Error::MissingConfig(builtin))?.into_call_config()?;
+                    // A `null` config (JSON `null`, i.e. no config) is the default config, matching
+                    // both a standalone `callTracer` and geth, which unmarshals `null` into an
+                    // unchanged config struct.
+                    let call_config = tracer_config.unwrap_or_default().into_call_config()?;
 
                     inspector_config
                         .merge(TracingInspectorConfig::from_geth_call_config(&call_config));
                     configs.push((builtin, TraceConfig::Call(call_config)));
                 }
                 GethDebugBuiltInTracerType::PreStateTracer => {
-                    let prestate_config = tracer_config
-                        .ok_or(Error::MissingConfig(builtin))?
-                        .into_pre_state_config()?;
+                    let prestate_config =
+                        tracer_config.unwrap_or_default().into_pre_state_config()?;
 
                     inspector_config
                         .merge(TracingInspectorConfig::from_geth_prestate_config(&prestate_config));
@@ -81,9 +82,8 @@ impl MuxInspector {
                     configs.push((builtin, TraceConfig::Noop));
                 }
                 GethDebugBuiltInTracerType::FlatCallTracer => {
-                    let flatcall_config = tracer_config
-                        .ok_or(Error::MissingConfig(builtin))?
-                        .into_flat_call_config()?;
+                    let flatcall_config =
+                        tracer_config.unwrap_or_default().into_flat_call_config()?;
 
                     inspector_config
                         .merge(TracingInspectorConfig::from_flat_call_config(&flatcall_config));
@@ -341,6 +341,26 @@ mod tests {
                     "{builtin:?} must accept config {config:?}"
                 );
             }
+        }
+    }
+
+    /// A `null` sub-config selects the tracer's default config, as geth does, rather than being
+    /// rejected as a missing config. A standalone `callTracer` etc. already accept `null`.
+    #[test]
+    fn test_config_taking_tracers_accept_a_null_config() {
+        for builtin in [
+            GethDebugBuiltInTracerType::CallTracer,
+            GethDebugBuiltInTracerType::PreStateTracer,
+            GethDebugBuiltInTracerType::FlatCallTracer,
+        ] {
+            let mux = MuxConfig(HashMap::from_iter([(
+                GethDebugTracerType::BuiltInTracer(builtin),
+                None,
+            )]));
+            assert!(
+                MuxInspector::try_from_config(mux).is_ok(),
+                "{builtin:?} must accept a null config"
+            );
         }
     }
 }
