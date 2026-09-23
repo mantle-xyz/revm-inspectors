@@ -35,6 +35,7 @@ use revm::{
     },
     DatabaseRef, Inspector,
 };
+use std::time::{Duration, Instant};
 
 pub(crate) mod bindings;
 pub(crate) mod builtins;
@@ -96,6 +97,12 @@ pub struct JsInspector {
     /// `jsTracer.err`: once a hook throws the rest are skipped and [`Self::result`] reports
     /// the error instead of a silently incomplete trace.
     hook_error: Option<JsInspectorError>,
+    /// The wall-clock limit for the whole trace, carried across [`Self::try_clone`] so a reused
+    /// inspector applies the same limit to each transaction.
+    timeout: Option<Duration>,
+    /// The instant the current trace must stop by, derived from `timeout` when the inspector is
+    /// built. Checked at every hook so a script running across many hooks is cut off once past it.
+    deadline: Option<Instant>,
 }
 
 impl JsInspector {
@@ -208,6 +215,8 @@ impl JsInspector {
             last_start_step_op: None,
             pending_step: None,
             hook_error: None,
+            timeout: None,
+            deadline: None,
         })
     }
 
@@ -216,9 +225,41 @@ impl JsInspector {
         &self.config
     }
 
+    /// Sets a wall-clock limit for the trace and starts the clock now.
+    ///
+    /// Once the limit passes, the next hook the EVM invokes stops the script and [`Self::result`]
+    /// reports `execution timeout`, matching go-ethereum's `debug_trace*` timeout. A script that
+    /// stays inside a single hook is not interrupted: Boa has no way to interrupt running code,
+    /// so the check can only run between hooks.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self.deadline = Some(Instant::now() + timeout);
+        self
+    }
+
+    /// Records a timeout as the first hook error when the deadline has passed, so the remaining
+    /// hooks are skipped and [`Self::result`] reports it. Returns whether the trace should stop.
+    fn deadline_exceeded(&mut self) -> bool {
+        if self.hook_error.is_some() {
+            return true;
+        }
+        if self.deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            self.hook_error = Some(JsInspectorError::Timeout);
+            return true;
+        }
+        false
+    }
+
     /// Creates a fresh inspector from the same code and config, resetting all execution state.
+    ///
+    /// The timeout is carried over and its clock restarts, so a reused inspector applies the same
+    /// limit afresh to each transaction, as go-ethereum does when tracing a block.
     pub fn try_clone(&self) -> Result<Self, JsInspectorError> {
-        Self::new(self.code.clone(), self.config.clone())
+        let cloned = Self::new(self.code.clone(), self.config.clone())?;
+        Ok(match self.timeout {
+            Some(timeout) => cloned.with_timeout(timeout),
+            None => cloned,
+        })
     }
 
     /// Returns the transaction context.
@@ -272,8 +313,12 @@ impl JsInspector {
         // A hook that threw leaves the tracer's state half-built, so report the failure
         // instead of a trace that silently omits whatever the hook did not record. The error
         // is rebuilt rather than taken, so asking for the result twice answers the same way.
-        if let Some(JsInspectorError::JsError(err)) = &self.hook_error {
-            return Err(JsInspectorError::JsError(err.clone()));
+        match &self.hook_error {
+            Some(JsInspectorError::JsError(err)) => {
+                return Err(JsInspectorError::JsError(err.clone()));
+            }
+            Some(JsInspectorError::Timeout) => return Err(JsInspectorError::Timeout),
+            _ => {}
         }
 
         let ResultAndState { result, state } = res;
@@ -353,9 +398,10 @@ impl JsInspector {
         }
     }
 
-    /// Whether a hook has already thrown, in which case the remaining hooks are skipped.
-    const fn hook_errored(&self) -> bool {
-        self.hook_error.is_some()
+    /// Whether the remaining hooks should be skipped: a hook has already thrown, or the trace has
+    /// run past its deadline (which is recorded as the first hook error when it happens).
+    fn hook_errored(&mut self) -> bool {
+        self.deadline_exceeded()
     }
 
     fn try_fault(&mut self, step: StepLog, db: EvmDbRef) -> JsResult<()> {
@@ -797,6 +843,10 @@ pub enum JsInspectorError {
     /// Invalid JSON configuration encountered.
     #[error("invalid JSON config: {0}")]
     InvalidJsonConfig(JsError),
+
+    /// The trace ran past the configured wall-clock timeout.
+    #[error("execution timeout")]
+    Timeout,
 }
 
 /// A snapshot of the interpreter taken before an instruction runs.
@@ -2283,5 +2333,71 @@ mod tests {
         }"#;
         let res = run_trace(code, Some(bytes!("0x5F5F52600100")), true);
         assert_eq!(res, json!([json!({}), json!({}), json!({"0": 0})]));
+    }
+
+    /// Runs a tracer whose inspector carries the given timeout, returning what `result()` reports.
+    fn run_trace_with_timeout(
+        code: &str,
+        timeout: Duration,
+    ) -> Result<serde_json::Value, JsInspectorError> {
+        let addr = Address::repeat_byte(0x01);
+        let mut db = CacheDB::new(EmptyDB::default());
+        db.insert_account_info(
+            Address::ZERO,
+            AccountInfo { balance: U256::from(1e18), ..Default::default() },
+        );
+        db.insert_account_info(
+            addr,
+            AccountInfo {
+                // PUSH1 1, PUSH1 1, STOP — three steps, so the step hook runs.
+                code: Some(Bytecode::new_legacy(hex!("6001600100").into())),
+                ..Default::default()
+            },
+        );
+
+        let insp = JsInspector::new(code.to_string(), serde_json::Value::Null)
+            .unwrap()
+            .with_timeout(timeout);
+        let mut evm = revm::Context::mainnet()
+            .modify_cfg_chained(|cfg| cfg.spec = SpecId::CANCUN)
+            .with_db(db)
+            .build_mainnet_with_inspector(insp);
+        let res = evm
+            .inspect_tx(TxEnv {
+                gas_price: 1024,
+                gas_limit: 1_000_000,
+                kind: TransactTo::Call(addr),
+                ..Default::default()
+            })
+            .expect("pass without error");
+        let (ctx, inspector) = evm.ctx_inspector();
+        inspector.json_result(res, ctx.tx(), ctx.block(), ctx.db_ref())
+    }
+
+    #[test]
+    fn test_timeout_already_past_reports_execution_timeout() {
+        let code = r#"{step:function(){},fault:function(){},result:function(){return 1}}"#;
+        // A zero timeout is already past by the time the first step runs.
+        let err = run_trace_with_timeout(code, Duration::ZERO).unwrap_err();
+        assert!(matches!(err, JsInspectorError::Timeout), "got {err:?}");
+        assert_eq!(err.to_string(), "execution timeout");
+    }
+
+    #[test]
+    fn test_generous_timeout_does_not_fire() {
+        let code = r#"{step:function(){},fault:function(){},result:function(){return 1}}"#;
+        let res = run_trace_with_timeout(code, Duration::from_secs(60)).unwrap();
+        assert_eq!(res, json!(1));
+    }
+
+    #[test]
+    fn test_timeout_is_carried_across_try_clone() {
+        let code = r#"{step:function(){},fault:function(){},result:function(){return 1}}"#;
+        let insp = JsInspector::new(code.to_string(), serde_json::Value::Null)
+            .unwrap()
+            .with_timeout(Duration::from_secs(42));
+        let cloned = insp.try_clone().unwrap();
+        assert_eq!(cloned.timeout, Some(Duration::from_secs(42)));
+        assert!(cloned.deadline.is_some());
     }
 }

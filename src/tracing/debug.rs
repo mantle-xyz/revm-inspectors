@@ -21,6 +21,34 @@ use revm::{
 };
 use thiserror::Error;
 
+/// The timeout go-ethereum applies to a JS tracer when the request does not set one.
+#[cfg(feature = "js-tracer")]
+const DEFAULT_JS_TRACER_TIMEOUT: core::time::Duration = core::time::Duration::from_secs(5);
+
+/// Parses a single-term Go duration such as `"5s"`, `"1.5s"`, `"200ms"` or `"2m"`, the form
+/// `debug_trace*`'s `timeout` takes. Returns `None` for anything it does not recognise, including
+/// the compound form (`"1m30s"`), so the caller can fall back to a default.
+#[cfg(feature = "js-tracer")]
+fn parse_go_duration(s: &str) -> Option<core::time::Duration> {
+    let s = s.trim();
+    let unit_start = s.find(|c: char| c.is_ascii_alphabetic())?;
+    let (value, unit) = s.split_at(unit_start);
+    let value: f64 = value.parse().ok()?;
+    if !value.is_finite() || value < 0.0 {
+        return None;
+    }
+    let nanos_per_unit = match unit {
+        "ns" => 1.0,
+        "us" | "µs" | "μs" => 1_000.0,
+        "ms" => 1_000_000.0,
+        "s" => 1_000_000_000.0,
+        "m" => 60_000_000_000.0,
+        "h" => 3_600_000_000_000.0,
+        _ => return None,
+    };
+    Some(core::time::Duration::from_nanos((value * nanos_per_unit) as u64))
+}
+
 /// Inspector for the `debug` API
 ///
 /// This inspector is used to trace the execution of a transaction or call and supports all variants
@@ -75,7 +103,11 @@ impl DebugInspector {
 
     /// Create a new `DebugInspector` from the given tracing options.
     pub fn new(opts: GethDebugTracingOptions) -> Result<Self, DebugInspectorError> {
-        let GethDebugTracingOptions { config, tracer, tracer_config, .. } = opts;
+        let GethDebugTracingOptions { config, tracer, tracer_config, timeout, .. } = opts;
+        // `timeout` is only consumed by the JS tracer; keep the binding alive when it is compiled
+        // out so the destructure above does not warn.
+        #[cfg(not(feature = "js-tracer"))]
+        let _ = timeout;
 
         let this = if let Some(tracer) = tracer {
             #[allow(unreachable_patterns)]
@@ -156,7 +188,16 @@ impl DebugInspector {
                 #[cfg(feature = "js-tracer")]
                 GethDebugTracerType::JsTracer(code) => {
                     let config = tracer_config.into_json();
-                    Self::Js(crate::tracing::js::JsInspector::new(code, config)?.into())
+                    // go-ethereum applies a five-second timeout to JS tracers unless the request
+                    // overrides it; a malformed override falls back to that default rather than
+                    // running unbounded.
+                    let timeout = timeout
+                        .as_deref()
+                        .and_then(parse_go_duration)
+                        .unwrap_or(DEFAULT_JS_TRACER_TIMEOUT);
+                    let inspector =
+                        crate::tracing::js::JsInspector::new(code, config)?.with_timeout(timeout);
+                    Self::Js(inspector.into())
                 }
                 _ => {
                     // Note: this match is non-exhaustive in case we need to add support for
@@ -379,4 +420,30 @@ pub enum DebugInspectorError<DBError = core::convert::Infallible> {
     /// Database error
     #[error("database error: {0}")]
     Database(DBError),
+}
+
+#[cfg(all(test, feature = "js-tracer"))]
+mod tests {
+    use super::parse_go_duration;
+    use core::time::Duration;
+
+    #[test]
+    fn parses_single_term_go_durations() {
+        assert_eq!(parse_go_duration("5s"), Some(Duration::from_secs(5)));
+        assert_eq!(parse_go_duration("200ms"), Some(Duration::from_millis(200)));
+        assert_eq!(parse_go_duration("2m"), Some(Duration::from_secs(120)));
+        assert_eq!(parse_go_duration("1.5s"), Some(Duration::from_millis(1500)));
+        assert_eq!(parse_go_duration("100us"), Some(Duration::from_micros(100)));
+        assert_eq!(parse_go_duration(" 3s "), Some(Duration::from_secs(3)));
+    }
+
+    #[test]
+    fn rejects_unparseable_durations() {
+        assert_eq!(parse_go_duration("1m30s"), None); // compound not supported
+        assert_eq!(parse_go_duration("abc"), None);
+        assert_eq!(parse_go_duration("10"), None); // missing unit
+        assert_eq!(parse_go_duration("10x"), None); // unknown unit
+        assert_eq!(parse_go_duration("-1s"), None);
+        assert_eq!(parse_go_duration(""), None);
+    }
 }
