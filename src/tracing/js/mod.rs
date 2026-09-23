@@ -103,6 +103,10 @@ pub struct JsInspector {
     /// The instant the current trace must stop by, derived from `timeout` when the inspector is
     /// built. Checked at every hook so a script running across many hooks is cut off once past it.
     deadline: Option<Instant>,
+    /// The terminal [`InstructionResult`] of the root call, captured when it exits. The halt
+    /// reason handed to [`Self::result`] is a generic type whose `Debug` is a Rust type name, so
+    /// `ctx.error` is built from this instead, via [`utils::fmt_error_msg`].
+    root_instruction_result: Option<InstructionResult>,
 }
 
 impl JsInspector {
@@ -217,6 +221,7 @@ impl JsInspector {
             hook_error: None,
             timeout: None,
             deadline: None,
+            root_instruction_result: None,
         })
     }
 
@@ -342,8 +347,15 @@ impl JsInspector {
                 error = Some("execution reverted".to_string());
                 output_bytes = Some(output);
             }
-            ExecutionResult::Halt { reason, .. } => {
-                error = Some(format!("execution halted: {reason:?}"));
+            ExecutionResult::Halt { .. } => {
+                // The halt reason is a generic type whose Debug is a Rust type name; build the
+                // message from the root call's instruction result so `ctx.error` is a stable
+                // phrase, the same one callTracer reports for the frame.
+                error = Some(
+                    self.root_instruction_result
+                        .and_then(|res| utils::fmt_error_msg(res, TraceStyle::Geth))
+                        .unwrap_or_else(|| "execution halted".to_string()),
+                );
             }
         };
 
@@ -687,6 +699,9 @@ where
     }
 
     fn call_end(&mut self, _context: &mut CTX, _inputs: &CallInputs, outcome: &mut CallOutcome) {
+        if self.is_root_call_active() {
+            self.root_instruction_result = Some(outcome.result.result);
+        }
         if self.can_call_exit() {
             let frame_result = FrameResult {
                 gas_used: outcome.result.gas.total_gas_spent(),
@@ -739,6 +754,9 @@ where
         _inputs: &CreateInputs,
         outcome: &mut CreateOutcome,
     ) {
+        if self.is_root_call_active() {
+            self.root_instruction_result = Some(outcome.result.result);
+        }
         if self.can_call_exit() {
             let frame_result = FrameResult {
                 gas_used: outcome.result.gas.total_gas_spent(),
@@ -1322,6 +1340,23 @@ mod tests {
         // 0x0c is not a defined opcode.
         let res = run_trace(code, Some(hex!("0c").into()), false);
         assert_eq!(res, json!([{ "op": "opcode 0xc not defined", "err": "invalid opcode" }]));
+    }
+
+    /// `ctx.error` reports a stable phrase for a halting execution, not the halt reason's Rust
+    /// type name. `stack underflow` in particular used to fall through to the `Debug` output.
+    #[test]
+    fn test_ctx_error_is_a_stable_phrase() {
+        let code =
+            r#"{step:function(){},fault:function(){},result:function(ctx){return ctx.error}}"#;
+
+        // PUSH1 0xff, JUMP - an invalid jump destination.
+        assert_eq!(
+            run_trace(code, Some(hex!("60ff56").into()), false),
+            json!("invalid jump destination")
+        );
+
+        // ADD with an empty stack underflows.
+        assert_eq!(run_trace(code, Some(hex!("01").into()), false), json!("stack underflow"));
     }
 
     /// Running out of gas is metered before geth emits `OnOpcode`, so it is not a fault.
