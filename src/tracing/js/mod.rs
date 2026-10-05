@@ -376,7 +376,7 @@ impl JsInspector {
             input: tx.input().clone(),
             gas: tx.gas_limit(),
             gas_used,
-            gas_price: U256::from(effective_gas_tip(tx, block.basefee() as u128)),
+            gas_price: U256::from(tx.effective_gas_price(block.basefee() as u128)),
             intrinsic_gas: 0,
             value: tx.value(),
             block: block.number().try_into().unwrap_or(u64::MAX),
@@ -683,8 +683,6 @@ where
                 contract: call.contract.clone(),
                 kind: call.kind.to_str(),
                 gas: inputs.gas_limit,
-                // geth passes nil here for a static call, so `getValue()` is `undefined`.
-                value: (!matches!(inputs.scheme, CallScheme::StaticCall)).then_some(value),
             };
             if let Err(err) = self.try_enter(frame) {
                 self.record_hook_error("enter", err.clone());
@@ -737,7 +735,6 @@ where
                 contract: call.contract.clone(),
                 kind: call.kind.to_str(),
                 gas: call.gas_limit,
-                value: Some(call.contract.value),
             };
             if let Err(err) = self.try_enter(frame) {
                 self.record_hook_error("enter", err.clone());
@@ -790,7 +787,6 @@ where
                 },
                 kind: "SELFDESTRUCT",
                 gas: 0,
-                value: Some(value),
             };
             if let Err(err) = self.try_enter(frame) {
                 self.record_hook_error("enter", err);
@@ -949,26 +945,6 @@ fn js_error_to_revert(err: JsError) -> InterpreterResult {
     InterpreterResult { result: InstructionResult::Revert, output: output.into(), gas: Gas::new(0) }
 }
 
-/// Returns `min(gasTipCap, gasFeeCap - baseFee)`, what go-ethereum surfaces to a tracer as
-/// `ctx.gasPrice`. It is the tip alone, so it is *less* than the sender paid per unit of gas.
-/// Legacy and EIP-2930 transactions have no separate tip cap; geth uses their gas price as both.
-fn effective_gas_tip(tx: &impl Transaction, base_fee: u128) -> u128 {
-    let fee_cap = tx.max_fee_per_gas();
-    effective_gas_tip_from(fee_cap, tx.max_priority_fee_per_gas().unwrap_or(fee_cap), base_fee)
-}
-
-/// The arithmetic behind [`effective_gas_tip`], split out so it can be tested directly.
-fn effective_gas_tip_from(fee_cap: u128, tip_cap: u128, base_fee: u128) -> u128 {
-    if fee_cap < base_fee {
-        // Reproducing a quirk, not an oversight: geth subtracts in `uint256`, so this wraps to
-        // a huge value, the `min` below always picks the tip cap, and `OnTxStart` discards the
-        // `ErrGasFeeCapTooLow` that comes with it. Only reachable via `debug_traceCall`.
-        tip_cap
-    } else {
-        tip_cap.min(fee_cap - base_fee)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1090,11 +1066,11 @@ mod tests {
         assert!(msg.contains("step"), "error should name the failing hook, got: {msg}");
     }
 
-    /// `ctx.gasPrice` must be the effective *tip* and a big integer, as in go-ethereum. With
-    /// base fee 300 and legacy gas price 1000 the candidates are far apart: geth reports
-    /// `min(1000, 1000 - 300) = 700`, the price the sender actually pays is the full 1000.
+    /// `ctx.gasPrice` is the effective gas price the sender pays per gas — base fee plus tip — as
+    /// a big integer. With base fee 300 and legacy gas price 1000 that is the full 1000, not the
+    /// 700 tip that go-ethereum has reported since its tx-context refactor (go-ethereum#30809).
     #[test]
-    fn test_ctx_gas_price_is_effective_tip() {
+    fn test_ctx_gas_price_is_effective_gas_price() {
         let addr = Address::repeat_byte(0x01);
         let mut db = CacheDB::new(EmptyDB::default());
         db.insert_account_info(
@@ -1137,22 +1113,8 @@ mod tests {
         let (ctx, inspector) = evm.ctx_inspector();
         let res = inspector.json_result(res, ctx.tx(), ctx.block(), ctx.db_ref()).unwrap();
 
-        assert_eq!(res["price"], json!("700"), "gasPrice must exclude the base fee");
+        assert_eq!(res["price"], json!("1000"), "gasPrice must include the base fee");
         assert_eq!(res["kind"], json!("object"), "gasPrice must be a bigInt, not a JS number");
-    }
-
-    /// When the fee cap is below the base fee geth reports the full tip cap, because its
-    /// `uint256` subtraction wraps. Saturating to zero is the intuitive reading and the one
-    /// that diverges. Reachable via `debug_traceCall`, which does not enforce the base fee.
-    #[test]
-    fn test_effective_gas_tip_below_base_fee_matches_geth() {
-        // (fee cap, tip cap, base fee) -> expected tip
-        assert_eq!(effective_gas_tip_from(100, 50, 300), 50, "fee cap under base fee: tip cap");
-        assert_eq!(effective_gas_tip_from(1000, 50, 300), 50, "tip cap binds");
-        assert_eq!(effective_gas_tip_from(1000, 900, 300), 700, "headroom binds");
-        // Legacy and EIP-2930: the gas price stands in for both caps.
-        assert_eq!(effective_gas_tip_from(1000, 1000, 300), 700, "legacy");
-        assert_eq!(effective_gas_tip_from(0, 0, 0), 0, "zero-priced transaction");
     }
 
     /// The lazily-defined `ctx` fields must be indistinguishable from ordinary properties:
@@ -1649,10 +1611,10 @@ mod tests {
         );
     }
 
-    /// A delegate call inherits the parent's value; a static call reports none at all.
+    /// A delegate call inherits the parent's value; a static call transfers nothing.
     ///
-    /// geth passes the parent's value to `OnEnter` for `DELEGATECALL` and nil for
-    /// `STATICCALL`, so `frame.getValue()` is `undefined` only in the latter case.
+    /// geth reports the static call's value as `undefined`; zero is kept here instead, since it is
+    /// the truthful amount and scripts calling `getValue().toString()` on every frame keep working.
     #[test]
     fn test_frame_value_for_delegate_and_static_calls() {
         // Pushes the six arguments both opcodes take, then the opcode itself and STOP.
@@ -1722,8 +1684,8 @@ mod tests {
 
         // DELEGATECALL keeps the 777 wei the outer call received.
         assert_eq!(frame_value(0xf4), json!({ "kind": "object", "value": "777" }));
-        // STATICCALL has no value of its own.
-        assert_eq!(frame_value(0xfa), json!({ "kind": "undefined", "value": null }));
+        // STATICCALL transfers nothing, reported as zero.
+        assert_eq!(frame_value(0xfa), json!({ "kind": "object", "value": "0" }));
     }
 
     /// Frame tracing needs both `enter` and `exit`, as geth requires.

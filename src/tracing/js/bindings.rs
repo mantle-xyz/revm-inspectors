@@ -718,14 +718,11 @@ pub(crate) struct CallFrame {
     /// selfdestruct is reported as its own frame type, which `CallKind` does not model.
     pub(crate) kind: &'static str,
     pub(crate) gas: u64,
-    /// `None` reaches JavaScript as `undefined`, which is what geth reports for a static call.
-    pub(crate) value: Option<U256>,
 }
 
 impl CallFrame {
     pub(crate) fn into_js_object(self, ctx: &mut Context) -> JsResult<JsObject> {
-        let Self { contract: Contract { caller, contract, value: _, input }, kind, gas, value } =
-            self;
+        let Self { contract: Contract { caller, contract, value, input }, kind, gas } = self;
         let obj = JsObject::with_object_proto(ctx.intrinsics());
 
         let get_from = FunctionObjectBuilder::new(
@@ -748,10 +745,7 @@ impl CallFrame {
 
         let get_value = FunctionObjectBuilder::new(
             ctx.realm(),
-            NativeFunction::from_copy_closure(move |_this, _args, ctx| match value {
-                Some(value) => to_bigint(value, ctx),
-                None => Ok(JsValue::undefined()),
-            }),
+            NativeFunction::from_copy_closure(move |_this, _args, ctx| to_bigint(value, ctx)),
         )
         .length(0)
         .build();
@@ -830,9 +824,9 @@ pub(crate) struct JsEvmContext {
     pub(crate) gas: u64,
     /// Number, amount of gas used in executing the transaction (excludes txdata costs)
     pub(crate) gas_used: u64,
-    /// big.int, the effective gas tip of the transaction being executed. Despite the
-    /// `gasPrice` name this excludes the base fee, matching go-ethereum, whose `OnTxStart`
-    /// assigns `tx.EffectiveGasTip(baseFee)`.
+    /// big.int, the effective gas price of the transaction being executed: base fee plus tip,
+    /// capped at the fee cap. This is the price the sender pays per gas, so `gasUsed * gasPrice`
+    /// is the execution fee.
     pub(crate) gas_price: U256,
     /// Number, intrinsic gas of the transaction. go-ethereum dropped this field in #26048, so it
     /// has no geth counterpart. Not implemented here either: the value is always 0.
