@@ -474,12 +474,12 @@ impl JsInspector {
     }
 
     /// The transaction-level refund accumulated by the frames enclosing the one about to begin.
-    fn refund_for_child(&self) -> u64 {
+    fn refund_for_child(&self) -> i64 {
         self.call_stack.last().map_or(0, |c| c.enclosing_refund + c.own_refund)
     }
 
     /// The refund of the frames enclosing the active one.
-    fn enclosing_refund(&self) -> u64 {
+    fn enclosing_refund(&self) -> i64 {
         self.call_stack.last().map_or(0, |c| c.enclosing_refund)
     }
 
@@ -550,7 +550,7 @@ where
         // Recorded unconditionally too: a child frame begins in `call`, where the interpreter is
         // out of reach, so its snapshot has to come from the value last seen here.
         if let Some(frame) = self.call_stack.last_mut() {
-            frame.own_refund = interp.gas.refunded().max(0) as u64;
+            frame.own_refund = interp.gas.refunded();
         }
 
         if self.step_fn.is_none() {
@@ -594,8 +594,11 @@ where
 
         // The instruction has run, so its cost is now the difference in remaining gas. geth
         // reports this from `OnOpcode`, which it emits after metering but before executing.
-        if let Some(pending) = self.pending_step.take() {
+        if let Some(mut pending) = self.pending_step.take() {
             let cost = pending.gas_remaining.saturating_sub(interp.gas.remaining());
+            // Like the cost, the refund is read after the instruction: geth meters an SSTORE's
+            // refund with its dynamic gas, before `OnOpcode`, so the step includes it.
+            pending.refund = refunded_gas(interp, self.enclosing_refund());
             let (db, _db_guard) =
                 EvmDbRef::new(context.journal_ref().evm_state(), context.db_ref());
             // Scoped so the guards and the memory borrow are released before `interp` is used
@@ -814,9 +817,10 @@ struct CallStackItem {
     /// revm keeps the counter per frame and merges a child into its parent only once the child
     /// returns successfully, so a frame in progress sees only its own refunds. go-ethereum keeps
     /// one counter for the whole transaction. Adding this snapshot back reproduces its view.
-    enclosing_refund: u64,
+    enclosing_refund: i64,
     /// This frame's own refund as of the last instruction, used to seed a child's snapshot.
-    own_refund: u64,
+    /// Signed: a frame that undoes a refund an enclosing frame earned has a negative counter.
+    own_refund: i64,
 }
 
 /// Error variants that can occur during JavaScript inspection.
@@ -931,11 +935,11 @@ const fn is_fault(result: InstructionResult) -> bool {
     }
 }
 
-/// Returns the interpreter's refund counter as an unsigned value, clamping the negative values
-/// `Gas::refunded` reports when a storage clear is reversed. Scope still differs from geth's
-/// transaction-wide `StateDB.GetRefund()`; aligning needs the journal's transaction-level counter.
-fn refunded_gas(interp: &Interpreter, enclosing: u64) -> u64 {
-    enclosing.saturating_add(interp.gas.refunded().max(0) as u64)
+/// Returns the transaction-wide refund counter: the enclosing frames' refund plus the active
+/// frame's own. The frame's own counter can be negative, so the sum is taken signed and only the
+/// total is floored at zero.
+fn refunded_gas(interp: &Interpreter, enclosing: i64) -> u64 {
+    (enclosing + interp.gas.refunded()).max(0) as u64
 }
 
 /// Converts a JavaScript error into a [InstructionResult::Revert] [InterpreterResult].
@@ -2347,5 +2351,86 @@ mod tests {
         let cloned = insp.try_clone().unwrap();
         assert_eq!(cloned.timeout, Some(Duration::from_secs(42)));
         assert!(cloned.deadline.is_some());
+    }
+
+    /// Runs `outer` with slot 0 of every listed account preset to 1, returning one
+    /// `depth:op:refund` entry per step.
+    fn refund_steps(accounts: &[(Address, Vec<u8>)], outer: Address) -> Vec<String> {
+        let mut db = CacheDB::new(EmptyDB::default());
+        db.insert_account_info(
+            Address::ZERO,
+            AccountInfo { balance: U256::from(1e18), ..Default::default() },
+        );
+        for (addr, code) in accounts {
+            db.insert_account_info(
+                *addr,
+                AccountInfo {
+                    code: Some(Bytecode::new_legacy(code.clone().into())),
+                    ..Default::default()
+                },
+            );
+            db.insert_account_storage(*addr, U256::ZERO, U256::from(1)).unwrap();
+        }
+        let code = r#"{r:[],step:function(log){this.r.push(log.getDepth()+':'+log.op.toString()+':'+log.getRefund())},fault:function(){},result:function(){return this.r}}"#;
+        let insp = JsInspector::new(code.to_string(), serde_json::Value::Null).unwrap();
+        let mut evm = revm::Context::mainnet()
+            .modify_cfg_chained(|cfg| cfg.spec = SpecId::CANCUN)
+            .with_db(db)
+            .build_mainnet_with_inspector(insp);
+        let res = evm
+            .inspect_tx(TxEnv {
+                gas_limit: 1_000_000,
+                kind: TransactTo::Call(outer),
+                ..Default::default()
+            })
+            .expect("pass without error");
+        let (ctx, inspector) = evm.ctx_inspector();
+        serde_json::from_value(
+            inspector.json_result(res, ctx.tx(), ctx.block(), ctx.db_ref()).unwrap(),
+        )
+        .unwrap()
+    }
+
+    /// `SSTORE slot0 = 0`, then `op` (CALL or DELEGATECALL) to `target`, then `STOP`.
+    fn clear_then_call(op: u8, target: Address) -> Vec<u8> {
+        let mut code = hex!("6000600055").to_vec();
+        code.extend_from_slice(&hex!("6000600060006000"));
+        if op == 0xf1 {
+            code.extend_from_slice(&hex!("6000")); // value
+        }
+        code.push(0x73);
+        code.extend_from_slice(target.as_slice());
+        code.extend_from_slice(&hex!("61ffff"));
+        code.push(op);
+        code.push(0x00);
+        code
+    }
+
+    #[test]
+    fn test_get_refund_includes_the_current_sstore() {
+        // geth meters an SSTORE's refund with its dynamic gas, before `OnOpcode`, so the SSTORE
+        // step already reports the counter including it.
+        let (outer, inner) = (Address::repeat_byte(0xaa), Address::repeat_byte(0xbb));
+        let steps = refund_steps(
+            &[(outer, clear_then_call(0xf1, inner)), (inner, hex!("600060005500").to_vec())],
+            outer,
+        );
+        assert!(steps.contains(&"1:SSTORE:4800".to_string()), "{steps:?}");
+        assert!(steps.contains(&"2:SSTORE:9600".to_string()), "{steps:?}");
+    }
+
+    #[test]
+    fn test_get_refund_does_not_clamp_a_negative_frame_counter() {
+        // The outer frame clears slot 0 (+4800), then a delegate call writes it back (-4800 +
+        // 2800). The delegated frame's own counter is -2000, so the transaction-wide counter is
+        // 2800; clamping the frame counter to zero before adding would report 4800.
+        let (outer, restorer) = (Address::repeat_byte(0xaa), Address::repeat_byte(0xcc));
+        let steps = refund_steps(
+            &[(outer, clear_then_call(0xf4, restorer)), (restorer, hex!("600160005500").to_vec())],
+            outer,
+        );
+        assert!(steps.contains(&"2:SSTORE:2800".to_string()), "{steps:?}");
+        assert!(steps.contains(&"2:STOP:2800".to_string()), "{steps:?}");
+        assert_eq!(steps.last().unwrap(), "1:STOP:2800", "{steps:?}");
     }
 }
