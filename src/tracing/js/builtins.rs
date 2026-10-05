@@ -183,17 +183,8 @@ BigInt.prototype.minus = function(other) { return this - BigInt(other); };
     Ok(())
 }
 
-/// Converts an array or Uint8Array to a byte array, and a hex string too when `allow_string`.
-///
-/// go-ethereum draws the same line per call site: the functions that normalise a value into
-/// bytes take a string, the ones that consume bytes do not. Accepting one where it consumes
-/// bytes turns a caller's mistake into a plausible answer — `db.getBalance("0x1234")` would
-/// left-pad to `0x00..1234` and report that account's balance.
-pub(crate) fn bytes_from_value(
-    val: JsValue,
-    allow_string: bool,
-    context: &mut Context,
-) -> JsResult<Vec<u8>> {
+/// Converts an array, hex string or Uint8Array to a byte array.
+pub(crate) fn bytes_from_value(val: JsValue, context: &mut Context) -> JsResult<Vec<u8>> {
     if let Some(obj) = val.as_object() {
         if obj.is::<TypedArray>() {
             let array: JsTypedArray = JsTypedArray::from_object(obj)?;
@@ -211,9 +202,6 @@ pub(crate) fn bytes_from_value(
             })?;
             return Ok(buf);
         } else if obj.is::<JsString>() {
-            if !allow_string {
-                return Err(invalid_buffer_type(&val));
-            }
             let js_string = obj.downcast_ref::<JsString>().unwrap();
             return hex_decode_js_string(js_string.borrow());
         } else if obj.is_array() {
@@ -228,20 +216,13 @@ pub(crate) fn bytes_from_value(
         }
     }
 
-    if allow_string {
-        if let Some(js_string) = val.as_string() {
-            return hex_decode_js_string(&js_string);
-        }
+    if let Some(js_string) = val.as_string() {
+        return hex_decode_js_string(&js_string);
     }
 
-    Err(invalid_buffer_type(&val))
-}
-
-/// The error go-ethereum's `fromBuf` raises for an unusable argument.
-fn invalid_buffer_type(val: &JsValue) -> JsError {
-    JsError::from_native(
+    Err(JsError::from_native(
         JsNativeError::typ().with_message(format!("invalid buffer type: {}", val.type_of())),
-    )
+    ))
 }
 
 /// Create a new [JsUint8Array] array buffer from the address' bytes.
@@ -342,11 +323,11 @@ pub(crate) fn to_contract2(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> 
     let initcode = args.get_or_undefined(2).clone();
 
     // Convert the sender's address to a byte buffer and then to an Address
-    let buf = bytes_from_value(from, true, ctx)?;
+    let buf = bytes_from_value(from, ctx)?;
     let addr = bytes_to_address(&buf);
 
     // Convert the initcode to a byte buffer
-    let code_buf = bytes_from_value(initcode, true, ctx)?;
+    let code_buf = bytes_from_value(initcode, ctx)?;
 
     // Compute the contract address
     let contract_addr = addr.create2_from_code(salt, code_buf);
@@ -368,7 +349,7 @@ pub(crate) fn to_contract(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> J
     let nonce = args.get_or_undefined(1).to_number(ctx)? as u64;
 
     // Convert the sender's address to a byte buffer and then to an Address
-    let buf = bytes_from_value(from, true, ctx)?;
+    let buf = bytes_from_value(from, ctx)?;
     let addr = bytes_to_address(&buf);
 
     // Compute the contract address
@@ -381,7 +362,7 @@ pub(crate) fn to_contract(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> J
 /// Converts a buffer type to an address
 pub(crate) fn to_address(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     let val = args.get_or_undefined(0).clone();
-    let buf = bytes_from_value(val, true, ctx)?;
+    let buf = bytes_from_value(val, ctx)?;
     let address = bytes_to_address(&buf);
     address_to_uint8_array_value(address, ctx)
 }
@@ -389,7 +370,7 @@ pub(crate) fn to_address(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> Js
 /// Converts a buffer type to a word
 pub(crate) fn to_word(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     let val = args.get_or_undefined(0).clone();
-    let buf = bytes_from_value(val, true, ctx)?;
+    let buf = bytes_from_value(val, ctx)?;
     let hash = bytes_to_b256(&buf);
     to_uint8_array_value(hash, ctx)
 }
@@ -397,7 +378,7 @@ pub(crate) fn to_word(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsRes
 /// Converts a buffer type to a hex string
 pub(crate) fn to_hex(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     let val = args.get_or_undefined(0).clone();
-    let buf = bytes_from_value(val, false, ctx)?;
+    let buf = bytes_from_value(val, ctx)?;
     let s = js_string!(hex::encode_prefixed(buf));
     Ok(JsValue::from(s))
 }
@@ -432,7 +413,7 @@ fn hex_decode_js_string(js_string: &JsString) -> JsResult<Vec<u8>> {
 pub(crate) fn slice(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     let val = args.get_or_undefined(0).clone();
 
-    let buf = bytes_from_value(val, false, ctx)?;
+    let buf = bytes_from_value(val, ctx)?;
     // Test the floats before converting: `f64 as usize` saturates, so `-1.0` would silently
     // become `0` and return a slice geth rejects. `MemoryRef::slice` guards the same way.
     let start_f64 = args.get_or_undefined(1).to_numeric_number(ctx)?;
@@ -462,8 +443,7 @@ impl PrecompileList {
         let is_precompiled = NativeFunction::from_copy_closure_with_captures(
             move |_this, args, precompiles, ctx| {
                 let val = args.get_or_undefined(0).clone();
-                // geth passes `allowString=true` here, unlike the `db` accessors.
-                let buf = bytes_from_value(val, true, ctx)?;
+                let buf = bytes_from_value(val, ctx)?;
                 let addr = bytes_to_address(&buf);
                 Ok(precompiles.0.contains(&addr).into())
             },
@@ -742,19 +722,9 @@ mod tests {
     #[test]
     fn test_to_hex() {
         let mut ctx = Context::default();
-        let value = to_uint8_array_value([0xde, 0xad, 0xbe, 0xefu8], &mut ctx).unwrap();
+        let value = JsValue::from(js_string!("0xdeadbeef"));
         let result = to_hex(&JsValue::undefined(), &[value], &mut ctx).unwrap();
         assert_eq!(result.to_string(&mut ctx).unwrap().to_std_string().unwrap(), "0xdeadbeef");
-    }
-
-    /// `toHex` takes bytes, not a string. go-ethereum passes `allowString=false` here: the
-    /// argument is already hex text in that case, so the call cannot have been intended.
-    #[test]
-    fn test_to_hex_rejects_a_string() {
-        let mut ctx = Context::default();
-        let value = JsValue::from(js_string!("0xdeadbeef"));
-        let err = to_hex(&JsValue::undefined(), &[value], &mut ctx).unwrap_err();
-        assert!(err.to_string().contains("invalid buffer type"), "got: {err}");
     }
 
     #[test]

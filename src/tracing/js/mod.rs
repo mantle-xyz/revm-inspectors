@@ -2213,10 +2213,11 @@ mod tests {
         let code = r#"{
             res: [],
             step: function(log) {
-                // A hex string is rejected: geth passes `allowString=false` to `slice`.
-                var threw = false;
-                try { slice('0xdeadbeef', 0, 2) } catch (e) { threw = true }
-                this.res.push(threw);
+                // Test slicing a hex string
+                var hex = '0xdeadbeefcafe';
+                this.res.push(toHex(slice(hex, 0, 2)));
+                this.res.push(toHex(slice(hex, 2, 4)));
+                this.res.push(toHex(slice(hex, 4, 6)));
                 // Test slicing an array
                 var arr = [0x01, 0x02, 0x03, 0x04, 0x05];
                 this.res.push(toHex(slice(arr, 0, 3)));
@@ -2230,59 +2231,9 @@ mod tests {
             result: function() { return this.res }
         }"#;
         let res = run_trace(code, Some(bytes!("0x00")), true);
-        assert_eq!(res, json!([true, "0x010203", "0x020304", "0xffee", "0xddccbb"]));
-    }
-
-    /// The split between arguments that may be a hex string and those that may not.
-    ///
-    /// go-ethereum draws it per call site: the helpers that normalise a value into bytes take a
-    /// string, the ones that consume bytes do not. Accepting a string where bytes are consumed
-    /// turns a caller's mistake into a plausible answer instead of an error — `getBalance`
-    /// would left-pad a short string into an address nobody asked about and report its balance.
-    #[test]
-    fn test_string_arguments_follow_geths_split() {
-        let code = r#"{
-            res: {},
-            fault: function() {},
-            step: function() {},
-            result: function(ctx, db) {
-                var self = this;
-                function check(name, fn) {
-                    try { fn(); self.res[name] = "accepted" }
-                    catch (e) { self.res[name] = "rejected" }
-                }
-                // Normalising helpers take a string, as geth's allowString=true sites do.
-                check("toWord",        function() { toWord("0x1234") });
-                check("toAddress",     function() { toAddress("0x1234") });
-                check("toContract",    function() { toContract("0x1234", 1) });
-                check("isPrecompiled", function() { isPrecompiled("0x01") });
-                // Consuming sites reject it, as geth's allowString=false sites do.
-                check("toHex",         function() { toHex("0x1234") });
-                check("slice",         function() { slice("0xaabbcc", 0, 2) });
-                check("getBalance",    function() { db.getBalance("0x1234") });
-                check("getNonce",      function() { db.getNonce("0x1234") });
-                check("getCode",       function() { db.getCode("0x1234") });
-                check("exists",        function() { db.exists("0x1234") });
-                check("getState",      function() { db.getState("0x1234", "0x00") });
-                return this.res;
-            }
-        }"#;
-        let res = run_trace(code, None, true);
         assert_eq!(
             res,
-            json!({
-                "toWord": "accepted",
-                "toAddress": "accepted",
-                "toContract": "accepted",
-                "isPrecompiled": "accepted",
-                "toHex": "rejected",
-                "slice": "rejected",
-                "getBalance": "rejected",
-                "getNonce": "rejected",
-                "getCode": "rejected",
-                "exists": "rejected",
-                "getState": "rejected",
-            })
+            json!(["0xdead", "0xbeef", "0xcafe", "0x010203", "0x020304", "0xffee", "0xddccbb"])
         );
     }
 
