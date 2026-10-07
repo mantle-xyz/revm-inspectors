@@ -403,10 +403,9 @@ impl JsInspector {
     /// - reth's `EthApiError` sends every other variant to `InvalidParams`, which this is not.
     fn record_hook_error(&mut self, hook: &'static str, err: JsError) {
         if self.hook_error.is_none() {
-            let message = format!("{err}    in server-side tracer function '{hook}'");
-            self.hook_error = Some(JsInspectorError::JsError(JsError::from_native(
-                JsNativeError::error().with_message(message),
-            )));
+            let suffix = format!("    in server-side tracer function '{hook}'");
+            let err = with_message_suffix(err, &suffix, &mut self.ctx);
+            self.hook_error = Some(JsInspectorError::JsError(err));
         }
     }
 
@@ -821,6 +820,40 @@ struct CallStackItem {
     /// This frame's own refund as of the last instruction, used to seed a child's snapshot.
     /// Signed: a frame that undoes a refund an enclosing frame earned has a negative counter.
     own_refund: i64,
+}
+
+/// Rebuilds `err` as a native error of the same kind whose message is the original one followed
+/// by `suffix`, e.g. `Error: boom    in server-side tracer function 'step'`.
+///
+/// Boa prints a native error's source position and a backtrace after its message, and wrapping
+/// `err` in a fresh `Error` would print a second kind (`Error: Error: boom`). go-ethereum reports a
+/// failing hook as a single line led by the error's own kind, so only the kind and the message
+/// are kept. A script may throw any value, not just an `Error`; such a value becomes the message
+/// of a plain `Error`.
+fn with_message_suffix(err: JsError, suffix: &str, ctx: &mut Context) -> JsError {
+    use boa_engine::JsNativeErrorKind as Kind;
+
+    let Ok(native) = err.try_native(ctx) else {
+        let thrown = err
+            .as_opaque()
+            .and_then(|value| value.to_string(ctx).ok())
+            .map(|s| s.to_std_string_escaped())
+            .unwrap_or_else(|| err.to_string());
+        return JsNativeError::error().with_message(format!("{thrown}{suffix}")).into();
+    };
+    let message = format!("{}{suffix}", native.message());
+    let rebuilt = match native.kind {
+        Kind::Aggregate(errors) => JsNativeError::aggregate(errors),
+        Kind::Eval => JsNativeError::eval(),
+        Kind::Range => JsNativeError::range(),
+        Kind::Reference => JsNativeError::reference(),
+        Kind::Syntax => JsNativeError::syntax(),
+        Kind::Type => JsNativeError::typ(),
+        Kind::Uri => JsNativeError::uri(),
+        Kind::RuntimeLimit => JsNativeError::runtime_limit(),
+        _ => JsNativeError::error(),
+    };
+    rebuilt.with_message(message).into()
 }
 
 /// Error variants that can occur during JavaScript inspection.
@@ -1798,8 +1831,29 @@ mod tests {
             "hook failures must stay in the JsError variant, got: {err:?}"
         );
         let msg = err.to_string();
-        assert!(msg.contains("boom"), "the JS message must survive, got: {msg}");
-        assert!(msg.contains("step"), "the hook must be named, got: {msg}");
+        assert_eq!(msg, "Error: boom    in server-side tracer function 'step'");
+    }
+
+    /// A hook failure keeps the thrown error's own kind and drops Boa's position and backtrace,
+    /// so the message is a single line like go-ethereum's.
+    #[test]
+    fn test_hook_failure_message_keeps_the_error_kind() {
+        let cases = [
+            ("null.x", "TypeError: cannot convert 'null' or 'undefined' to object"),
+            ("throw 'plain'", "Error: plain"),
+        ];
+        for (body, expected) in cases {
+            let code = format!(
+                "{{step: function() {{ {body}; }}, fault: function() {{}}, result: function() {{ return null }}}}"
+            );
+            let err = try_run_trace(&code, None, None, 1_000_000)
+                .expect_err("a throwing step hook must fail the trace");
+            assert_eq!(
+                err.to_string(),
+                format!("{expected}    in server-side tracer function 'step'"),
+                "for `{body}`"
+            );
+        }
     }
 
     #[test]
