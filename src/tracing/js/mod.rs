@@ -49,7 +49,9 @@ pub const LOOP_ITERATION_LIMIT: u64 = 200_000;
 /// The recursion limit for function calls.
 ///
 /// Once exceeded, the function will throw an error.
-pub const RECURSION_LIMIT: usize = 10_000;
+/// Kept below Boa's default because recursive accessors also consume native stack space; a
+/// higher limit lets a tracer overflow the native stack and abort the process (upstream #548).
+pub const RECURSION_LIMIT: usize = 128;
 
 /// A javascript inspector that will delegate inspector functions to javascript functions
 ///
@@ -279,7 +281,8 @@ impl JsInspector {
 
     /// Applies the runtime limits to the JS context.
     ///
-    /// By default
+    /// Increasing the recursion limit can overflow the native stack when tracing code uses
+    /// recursive property accessors.
     pub fn set_runtime_limits(&mut self, limits: RuntimeLimits) {
         self.ctx.set_runtime_limits(limits);
     }
@@ -2472,5 +2475,53 @@ mod tests {
         assert!(steps.contains(&"2:SSTORE:2800".to_string()), "{steps:?}");
         assert!(steps.contains(&"2:STOP:2800".to_string()), "{steps:?}");
         assert_eq!(steps.last().unwrap(), "1:STOP:2800", "{steps:?}");
+    }
+
+    #[test]
+    fn test_runtime_limits() {
+        let inspector = JsInspector::new(
+            "{fault: function() {}, result: function() {}}".into(),
+            serde_json::Value::Null,
+        )
+        .unwrap();
+        assert_eq!(inspector.ctx.runtime_limits().recursion_limit(), RECURSION_LIMIT);
+        assert_eq!(inspector.ctx.runtime_limits().loop_iteration_limit(), LOOP_ITERATION_LIMIT);
+    }
+
+    #[test]
+    fn test_accessor_recursion_limit() {
+        // A recursive getter or setter recurses through native frames; the recursion limit must
+        // trip before the native stack overflows, which would abort the process. Run on a small
+        // stack so an unbounded recursion would overflow well within the test.
+        //
+        // (Boa 0.21 cannot throw a runtime-limit error raised inside promise `.return()` thenable
+        // machinery - it panics converting it to a JS value - so that exotic case, covered by
+        // upstream #548 on Boa 0.22, is left out here.)
+        std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(|| {
+                for setup in [
+                    "const obj = {get x() {return this.x;}}; obj.x;",
+                    "const obj = {set x(value) {this.x = value;}}; obj.x = 1;",
+                ] {
+                    let code = format!(
+                        "{{setup: function() {{{setup}}}, fault: function() {{}}, result: function() {{}}}}"
+                    );
+                    let error = JsInspector::new(code, serde_json::Value::Null).unwrap_err();
+                    let JsInspectorError::SetupCallFailed(error) = error else {
+                        panic!("unexpected error: {error}");
+                    };
+                    assert!(
+                        matches!(
+                            error.as_native().map(|e| &e.kind),
+                            Some(boa_engine::JsNativeErrorKind::RuntimeLimit)
+                        ),
+                        "{error}"
+                    );
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 }
