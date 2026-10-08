@@ -54,38 +54,36 @@ impl MuxInspector {
             #[allow(unreachable_patterns)]
             match builtin {
                 GethDebugBuiltInTracerType::FourByteTracer => {
-                    if tracer_config.is_some() {
-                        return Err(Error::UnexpectedConfig(builtin));
-                    }
+                    // The config is ignored rather than rejected: geth hands each key's value to
+                    // the matching tracer's constructor, and this one takes none, so a caller
+                    // may well send `{"4byteTracer": {}}`.
                     four_byte = Some(FourByteInspector::default());
                 }
                 GethDebugBuiltInTracerType::CallTracer => {
-                    let call_config =
-                        tracer_config.ok_or(Error::MissingConfig(builtin))?.into_call_config()?;
+                    // A `null` config (JSON `null`, i.e. no config) is the default config, matching
+                    // both a standalone `callTracer` and geth, which unmarshals `null` into an
+                    // unchanged config struct.
+                    let call_config = tracer_config.unwrap_or_default().into_call_config()?;
 
                     inspector_config
                         .merge(TracingInspectorConfig::from_geth_call_config(&call_config));
                     configs.push((builtin, TraceConfig::Call(call_config)));
                 }
                 GethDebugBuiltInTracerType::PreStateTracer => {
-                    let prestate_config = tracer_config
-                        .ok_or(Error::MissingConfig(builtin))?
-                        .into_pre_state_config()?;
+                    let prestate_config =
+                        tracer_config.unwrap_or_default().into_pre_state_config()?;
 
                     inspector_config
                         .merge(TracingInspectorConfig::from_geth_prestate_config(&prestate_config));
                     configs.push((builtin, TraceConfig::PreState(prestate_config)));
                 }
                 GethDebugBuiltInTracerType::NoopTracer => {
-                    if tracer_config.is_some() {
-                        return Err(Error::UnexpectedConfig(builtin));
-                    }
+                    // Ignored for the same reason as `FourByteTracer` above.
                     configs.push((builtin, TraceConfig::Noop));
                 }
                 GethDebugBuiltInTracerType::FlatCallTracer => {
-                    let flatcall_config = tracer_config
-                        .ok_or(Error::MissingConfig(builtin))?
-                        .into_flat_call_config()?;
+                    let flatcall_config =
+                        tracer_config.unwrap_or_default().into_flat_call_config()?;
 
                     inspector_config
                         .merge(TracingInspectorConfig::from_flat_call_config(&flatcall_config));
@@ -104,6 +102,29 @@ impl MuxInspector {
         let tracing = (!configs.is_empty()).then(|| TracingInspector::new(inspector_config));
 
         Ok(MuxInspector { four_byte, tracing, configs })
+    }
+
+    /// Manually set the gas limit of the root trace.
+    ///
+    /// Forwards to [`TracingInspector::set_transaction_gas_limit`]. Without it the wrapped
+    /// tracers report the EVM's inner gas for the root frame, which disagrees with the same
+    /// tracer invoked on its own.
+    #[inline]
+    pub fn set_transaction_gas_limit(&mut self, gas_limit: u64) {
+        if let Some(inspector) = &mut self.tracing {
+            inspector.set_transaction_gas_limit(gas_limit);
+        }
+    }
+
+    /// Manually set the caller address of the root trace.
+    ///
+    /// Forwards to [`TracingInspector::set_transaction_caller`], for the same reason as
+    /// [`Self::set_transaction_gas_limit`].
+    #[inline]
+    pub fn set_transaction_caller(&mut self, caller: Address) {
+        if let Some(inspector) = &mut self.tracing {
+            inspector.set_transaction_caller(caller);
+        }
     }
 
     /// Try converting this [MuxInspector] into a [MuxFrame].
@@ -142,6 +163,7 @@ impl MuxInspector {
                         inspector
                             .clone()
                             .into_parity_builder()
+                            .with_transaction_gas_used(result.result.tx_gas_used())
                             .into_localized_transaction_traces(tx_info)
                             .into()
                     } else {
@@ -293,4 +315,52 @@ pub enum Error {
     /// Error when deserializing the config
     #[error("error deserializing config: {0}")]
     InvalidConfig(#[from] serde_json::Error),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_rpc_types_trace::geth::GethDebugTracerConfig;
+
+    /// Tracers that take no config must accept one anyway, as geth does.
+    ///
+    /// geth passes each key's value straight to the matching tracer's constructor, and both of
+    /// these ignore it, so `{"4byteTracer": {}}` is a request geth answers and we must too.
+    #[test]
+    fn test_config_free_tracers_tolerate_a_config() {
+        for builtin in
+            [GethDebugBuiltInTracerType::FourByteTracer, GethDebugBuiltInTracerType::NoopTracer]
+        {
+            for config in [None, Some(GethDebugTracerConfig(serde_json::json!({})))] {
+                let mux = MuxConfig(HashMap::from_iter([(
+                    GethDebugTracerType::BuiltInTracer(builtin),
+                    config.clone(),
+                )]));
+                assert!(
+                    MuxInspector::try_from_config(mux).is_ok(),
+                    "{builtin:?} must accept config {config:?}"
+                );
+            }
+        }
+    }
+
+    /// A `null` sub-config selects the tracer's default config, as geth does, rather than being
+    /// rejected as a missing config. A standalone `callTracer` etc. already accept `null`.
+    #[test]
+    fn test_config_taking_tracers_accept_a_null_config() {
+        for builtin in [
+            GethDebugBuiltInTracerType::CallTracer,
+            GethDebugBuiltInTracerType::PreStateTracer,
+            GethDebugBuiltInTracerType::FlatCallTracer,
+        ] {
+            let mux = MuxConfig(HashMap::from_iter([(
+                GethDebugTracerType::BuiltInTracer(builtin),
+                None,
+            )]));
+            assert!(
+                MuxInspector::try_from_config(mux).is_ok(),
+                "{builtin:?} must accept a null config"
+            );
+        }
+    }
 }

@@ -1,7 +1,6 @@
 //! Utility functions for revm related ops
 use crate::tracing::config::TraceStyle;
 use alloc::{
-    format,
     string::{String, ToString},
     vec::Vec,
 };
@@ -65,7 +64,68 @@ pub(crate) fn fmt_error_msg(res: InstructionResult, kind: TraceStyle) -> Option<
             "out of gas: not enough gas for reentrancy sentry"
         }
         .to_string(),
-        status => format!("{status:?}"),
+        InstructionResult::CallTooDeep => {
+            if kind.is_parity() { "Out of gas" } else { "max call depth exceeded" }.to_string()
+        }
+        InstructionResult::CallNotAllowedInsideStatic
+        | InstructionResult::StateChangeDuringStaticCall => {
+            if kind.is_parity() { "Mutable call in static context" } else { "write protection" }
+                .to_string()
+        }
+        InstructionResult::NotActivated => {
+            if kind.is_parity() { "Bad instruction" } else { "invalid opcode" }.to_string()
+        }
+        InstructionResult::StackUnderflow => {
+            if kind.is_parity() { "Stack underflow" } else { "stack underflow" }.to_string()
+        }
+        InstructionResult::OutOfOffset => {
+            if kind.is_parity() { "Out of bounds" } else { "return data out of bounds" }.to_string()
+        }
+        InstructionResult::CreateCollision => if kind.is_parity() {
+            "Contract address collision"
+        } else {
+            "contract address collision"
+        }
+        .to_string(),
+        InstructionResult::NonceOverflow => {
+            if kind.is_parity() { "Nonce overflow" } else { "nonce uint64 overflow" }.to_string()
+        }
+        InstructionResult::CreateContractSizeLimit => {
+            if kind.is_parity() { "Out of bounds" } else { "max code size exceeded" }.to_string()
+        }
+        InstructionResult::CreateInitCodeSizeLimit => {
+            if kind.is_parity() { "Out of bounds" } else { "max initcode size exceeded" }
+                .to_string()
+        }
+        InstructionResult::CreateContractStartingWithEF
+        | InstructionResult::CreateInitCodeStartingEF00 => if kind.is_parity() {
+            "Bad instruction"
+        } else {
+            "invalid code: must not begin with 0xef"
+        }
+        .to_string(),
+        InstructionResult::InvalidEOFInitCode => {
+            if kind.is_parity() { "Bad instruction" } else { "invalid eof init code" }.to_string()
+        }
+        InstructionResult::InvalidExtDelegateCallTarget => {
+            if kind.is_parity() { "Bad instruction" } else { "invalid extdelegatecall target" }
+                .to_string()
+        }
+        InstructionResult::InvalidImmediateEncoding => {
+            if kind.is_parity() { "Bad instruction" } else { "invalid immediate encoding" }
+                .to_string()
+        }
+        InstructionResult::OverflowPayment => {
+            if kind.is_parity() { "Overflow payment" } else { "overflow payment" }.to_string()
+        }
+        InstructionResult::FatalExternalError => {
+            if kind.is_parity() { "Internal error" } else { "fatal external error" }.to_string()
+        }
+        // Success codes never reach here: `is_ok()` returned above. Listed so the match stays
+        // exhaustive and a new revm variant breaks the build instead of printing a Rust type name.
+        InstructionResult::Stop | InstructionResult::Return | InstructionResult::SelfDestruct => {
+            return None
+        }
     };
 
     Some(msg)
