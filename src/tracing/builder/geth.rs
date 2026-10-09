@@ -173,14 +173,14 @@ impl<'a> GethTraceBuilder<'a> {
         let mut root_call_frame = main_trace_node.geth_empty_call_frame(include_logs);
         root_call_frame.gas_used = U256::from(gas_used);
 
+        if opts.only_top_call.unwrap_or_default() {
+            return root_call_frame;
+        }
+
         // selfdestructs are not recorded as individual call traces but are derived from
         // the call trace and are added as additional `CallFrame` objects to the parent call
         if let Some(selfdestruct) = main_trace_node.geth_selfdestruct_call_trace() {
             root_call_frame.calls.push(selfdestruct);
-        }
-
-        if opts.only_top_call.unwrap_or_default() {
-            return root_call_frame;
         }
 
         // fill all the call frames in the root call frame with the recorded traces.
