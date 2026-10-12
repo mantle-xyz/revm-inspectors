@@ -2524,6 +2524,26 @@ mod tests {
         assert_eq!(inspector.ctx.runtime_limits().loop_iteration_limit(), LOOP_ITERATION_LIMIT);
     }
 
+    /// `db.getState` reads a slot the transaction has already written as written, in a step and
+    /// in `result`, the way geth reads its live state rather than the committed one.
+    #[test]
+    fn test_get_state_sees_writes_of_the_transaction() {
+        let code = r#"{seen: [],
+            step: function(log, db) {
+                if (log.op.toString() == "SLOAD")
+                    this.seen.push(toHex(db.getState(log.contract.getAddress(), toWord("0x00"))));
+            },
+            fault: function() {},
+            result: function(ctx, db) {
+                this.seen.push(toHex(db.getState(ctx.to, toWord("0x00"))));
+                return this.seen;
+            }}"#;
+        // PUSH1 0x2a, PUSH1 0, SSTORE, PUSH1 0, SLOAD, STOP
+        let res = run_trace(code, Some(bytes!("602a60005560005400")), true);
+        let word = format!("0x{:064x}", 0x2a);
+        assert_eq!(res, json!([word, word]));
+    }
+
     /// Plain function recursion within the limit succeeds.
     #[test]
     fn test_function_recursion_within_limit_succeeds() {

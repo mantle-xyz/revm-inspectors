@@ -453,6 +453,20 @@ impl StateRef {
     fn get_account(&self, address: &Address) -> Option<AccountInfo> {
         self.0.with_inner(|state| state.get(address).map(|acc| acc.info.clone()))?
     }
+
+    /// The slot's value as the transaction has left it so far, or `None` if the transaction has
+    /// not touched it and the database holds the answer. A contract created by this transaction
+    /// starts with empty storage, so its untouched slots are zero rather than whatever the
+    /// database has for that address.
+    fn get_storage(&self, address: &Address, slot: U256) -> Option<U256> {
+        self.0.with_inner(|state| {
+            let acc = state.get(address)?;
+            acc.storage
+                .get(&slot)
+                .map(|slot| slot.present_value())
+                .or_else(|| acc.is_created().then_some(U256::ZERO))
+        })?
+    }
 }
 
 impl Finalize for StateRef {}
@@ -991,6 +1005,12 @@ impl EvmDbRef {
 
         let buf = bytes_from_value(slot, ctx)?;
         let slot = bytes_to_b256(&buf);
+
+        // geth reads the live state, so a slot this transaction has written reads back the
+        // written value rather than the one committed before the transaction.
+        if let Some(value) = self.inner.state.get_storage(&address, slot.into()) {
+            return to_uint8_array(B256::from(value), ctx);
+        }
 
         let res = self.inner.db.0.with_inner(|db| db.storage_ref(address, slot.into()));
 
