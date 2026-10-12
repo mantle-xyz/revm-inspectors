@@ -30,7 +30,6 @@ const DEFAULT_JS_TRACER_TIMEOUT: core::time::Duration = core::time::Duration::fr
 /// `us`/`µs`/`μs`, `ms`, `s`, `m`, `h`), as in `"1m30s"` or `"1.5h"`; a bare `"0"` is also
 /// accepted. Returns `None` for anything Go rejects. A negative duration has already expired, so it
 /// comes back as zero.
-#[cfg(feature = "js-tracer")]
 fn parse_go_duration(s: &str) -> Option<core::time::Duration> {
     // Go's limit: the magnitude of an `int64` count of nanoseconds.
     const MAX_NANOS: u128 = 1 << 63;
@@ -161,8 +160,14 @@ impl DebugInspector {
     /// Create a new `DebugInspector` from the given tracing options.
     pub fn new(opts: GethDebugTracingOptions) -> Result<Self, DebugInspectorError> {
         let GethDebugTracingOptions { config, tracer, tracer_config, timeout, .. } = opts;
-        // `timeout` is only consumed by the JS tracer; keep the binding alive when it is compiled
-        // out so the destructure above does not warn.
+        // go-ethereum rejects a `timeout` it cannot parse whichever tracer is asked for.
+        let timeout = timeout
+            .as_deref()
+            .map(|timeout| {
+                parse_go_duration(timeout).ok_or(DebugInspectorError::InvalidTracerConfig)
+            })
+            .transpose()?;
+        // Only the JS tracer enforces it.
         #[cfg(not(feature = "js-tracer"))]
         let _ = timeout;
 
@@ -246,12 +251,8 @@ impl DebugInspector {
                 GethDebugTracerType::JsTracer(code) => {
                     let config = tracer_config.into_json();
                     // go-ethereum applies a five-second timeout to JS tracers unless the request
-                    // overrides it, and rejects an override it cannot parse.
-                    let timeout = match timeout.as_deref() {
-                        Some(timeout) => parse_go_duration(timeout)
-                            .ok_or(DebugInspectorError::InvalidTracerConfig)?,
-                        None => DEFAULT_JS_TRACER_TIMEOUT,
-                    };
+                    // overrides it.
+                    let timeout = timeout.unwrap_or(DEFAULT_JS_TRACER_TIMEOUT);
                     let inspector =
                         crate::tracing::js::JsInspector::new(code, config)?.with_timeout(timeout);
                     Self::Js(inspector.into())
@@ -479,28 +480,38 @@ pub enum DebugInspectorError<DBError = core::convert::Infallible> {
     Database(DBError),
 }
 
-#[cfg(all(test, feature = "js-tracer"))]
+#[cfg(test)]
 mod tests {
     use super::{parse_go_duration, DebugInspector, DebugInspectorError};
-    use alloy_rpc_types_trace::geth::{GethDebugTracerType, GethDebugTracingOptions};
+    use alloy_rpc_types_trace::geth::{
+        GethDebugBuiltInTracerType, GethDebugTracerType, GethDebugTracingOptions,
+    };
     use core::time::Duration;
 
     /// A `timeout` that does not parse is rejected, as geth rejects it, instead of being replaced
-    /// by the default.
+    /// by the default, for the JS tracer and the built-in ones alike.
     #[test]
     fn rejects_an_unparseable_timeout() {
-        let opts = |timeout: &str| GethDebugTracingOptions {
-            tracer: Some(GethDebugTracerType::JsTracer(
-                "{fault: function() {}, result: function() {}}".into(),
-            )),
-            timeout: Some(timeout.into()),
-            ..Default::default()
-        };
-        assert!(matches!(
-            DebugInspector::new(opts("nonsense")),
-            Err(DebugInspectorError::InvalidTracerConfig)
-        ));
-        assert!(DebugInspector::new(opts("1m30s")).is_ok());
+        let tracers = [
+            GethDebugTracerType::BuiltInTracer(GethDebugBuiltInTracerType::CallTracer),
+            #[cfg(feature = "js-tracer")]
+            GethDebugTracerType::JsTracer("{fault: function() {}, result: function() {}}".into()),
+        ];
+        for tracer in tracers {
+            let opts = |timeout: &str| GethDebugTracingOptions {
+                tracer: Some(tracer.clone()),
+                timeout: Some(timeout.into()),
+                ..Default::default()
+            };
+            assert!(
+                matches!(
+                    DebugInspector::new(opts("nonsense")),
+                    Err(DebugInspectorError::InvalidTracerConfig)
+                ),
+                "{tracer:?}"
+            );
+            assert!(DebugInspector::new(opts("1m30s")).is_ok(), "{tracer:?}");
+        }
     }
 
     #[test]
