@@ -22,7 +22,7 @@ pub use boa_engine::vm::RuntimeLimits;
 use boa_engine::{js_string, Context, JsError, JsNativeError, JsObject, JsResult, JsValue, Source};
 use core::borrow::Borrow;
 use revm::{
-    bytecode::opcode,
+    bytecode::opcode::{self, OpCode},
     context::JournalTr,
     context_interface::{
         result::{ExecutionResult, HaltReasonTr, Output, ResultAndState},
@@ -32,7 +32,7 @@ use revm::{
     interpreter::{
         interpreter_types::{Jumps, LoopControl},
         CallInputs, CallOutcome, CallScheme, CreateInputs, CreateOutcome, Gas, InstructionResult,
-        Interpreter, InterpreterAction, InterpreterResult,
+        Interpreter, InterpreterAction, InterpreterResult, STACK_LIMIT,
     },
     DatabaseRef, Inspector,
 };
@@ -95,6 +95,8 @@ pub struct JsInspector {
     last_start_step_pc: Option<usize>,
     /// Opcode recorded in start_step, so `fault` can report the instruction that failed.
     last_start_step_op: Option<u8>,
+    /// Gas remaining before the instruction, for `fault` when there is no `step` snapshot.
+    last_start_step_gas: u64,
     /// Snapshot taken in `step`, consumed by `step_end` once the instruction's cost is known.
     pending_step: Option<PendingStep>,
     /// The first error thrown by one of the tracer's hooks, if any. Mirrors go-ethereum's
@@ -226,6 +228,7 @@ impl JsInspector {
             precompiles_registered: false,
             last_start_step_pc: None,
             last_start_step_op: None,
+            last_start_step_gas: 0,
             pending_step: None,
             hook_error: None,
             timeout: None,
@@ -561,6 +564,7 @@ where
         // when the tracer has no `step` hook, which is what geth does.
         self.last_start_step_pc = Some(interp.bytecode.pc());
         self.last_start_step_op = Some(interp.bytecode.opcode());
+        self.last_start_step_gas = interp.gas.remaining();
         // Recorded unconditionally too: a child frame begins in `call`, where the interpreter is
         // out of reach, so its snapshot has to come from the value last seen here.
         if let Some(frame) = self.call_stack.last_mut() {
@@ -601,12 +605,12 @@ where
     }
 
     fn step_end(&mut self, interp: &mut Interpreter, context: &mut CTX) {
-        let fault = interp
-            .bytecode
-            .action()
-            .as_ref()
-            .and_then(|a| a.instruction_result())
-            .filter(|r| is_fault(*r));
+        let halt = interp.bytecode.action().as_ref().and_then(|a| a.instruction_result());
+        let fault = halt.filter(|r| is_fault(*r));
+
+        // The `fault` hook sees the log the instruction's `step` saw, as geth's `OnFault` reuses
+        // the one from `OnOpcode`: the operands are still on the stack and the gas is from before.
+        let mut fault_step = None;
 
         // The instruction has run, so its cost is now the difference in remaining gas. geth
         // reports this from `OnOpcode`, which it emits after metering but before executing.
@@ -615,6 +619,14 @@ where
             // Like the cost, the refund is read after the instruction: geth meters an SSTORE's
             // refund with its dynamic gas, before `OnOpcode`, so the step includes it.
             pending.refund = refunded_gas(interp, self.enclosing_refund());
+            // An instruction rejected while metering never reaches geth's `fault`; geth hands
+            // that error to `step` instead.
+            let error = halt
+                .filter(|r| !r.is_ok() && !is_fault(*r))
+                .and_then(|r| pre_execution_error(r, pending.op, pending.stack.len()));
+            if fault.is_some() {
+                fault_step = Some((pending.clone(), cost));
+            }
             let (db, _db_guard) = EvmDbRef::with_pre_state(
                 context.journal_ref().evm_state(),
                 context.db_ref(),
@@ -626,7 +638,7 @@ where
                 let mem = interp.memory.borrow();
                 let post_memory = mem.context_memory();
                 let (step, _stack_guard, _memory_guard) =
-                    pending.into_step_log(cost, None, &post_memory);
+                    pending.into_step_log(cost, error, &post_memory);
                 self.try_step(step, db)
             };
             if let Err(err) = called {
@@ -648,29 +660,39 @@ where
         };
 
         let (db, _db_guard) = EvmDbRef::new(context.journal_ref().evm_state(), context.db_ref());
-        let active_call = self.active_call();
         let mem = interp.memory.borrow();
         let post_memory = mem.context_memory();
         let post_memory: &[u8] = &post_memory;
-        // The instruction failed, so there is no "before" to rebuild: geth's `OnFault` likewise
-        // reports the state as it stands. An empty snapshot serves the live memory unchanged.
-        let (step, _stack_guard, _memory_guard) = PendingStep {
-            stack: interp.stack.data().clone(),
-            memory: MemorySnapshot::unchanged(post_memory.len()),
-            pre_state: PreStepState::default(),
-            op: self.last_start_step_op.unwrap_or_default(),
-            pc: self.last_start_step_pc.unwrap_or_default() as u64,
-            gas_remaining: interp.gas.remaining(),
-            depth: context.journal_ref().depth() as u64,
-            refund: refunded_gas(interp, self.enclosing_refund()),
-            contract: Contract {
-                caller: interp.input.caller_address,
-                contract: interp.input.target_address,
-                value: active_call.contract.value,
-                input: active_call.contract.input.clone(),
-            },
-        }
-        .into_step_log(0, utils::fmt_error_msg(result, TraceStyle::Geth), post_memory);
+        let error = utils::fmt_error_msg(result, TraceStyle::Geth);
+        let (step, _stack_guard, _memory_guard) = match fault_step {
+            Some((mut pending, cost)) => {
+                pending.pre_state = PreStepState::default();
+                pending.into_step_log(cost, error, post_memory)
+            }
+            // Without a `step` hook nothing was copied before the instruction, and copying the
+            // stack on every instruction just for a fault would tax every such tracer. geth has
+            // nothing better here: its log is only filled in by `step`.
+            None => {
+                let active_call = self.active_call();
+                PendingStep {
+                    stack: interp.stack.data().clone(),
+                    memory: MemorySnapshot::unchanged(post_memory.len()),
+                    pre_state: PreStepState::default(),
+                    op: self.last_start_step_op.unwrap_or_default(),
+                    pc: self.last_start_step_pc.unwrap_or_default() as u64,
+                    gas_remaining: self.last_start_step_gas,
+                    depth: context.journal_ref().depth() as u64,
+                    refund: refunded_gas(interp, self.enclosing_refund()),
+                    contract: Contract {
+                        caller: interp.input.caller_address,
+                        contract: interp.input.target_address,
+                        value: active_call.contract.value,
+                        input: active_call.contract.input.clone(),
+                    },
+                }
+                .into_step_log(0, error, post_memory)
+            }
+        };
 
         if let Err(err) = self.try_fault(step, db) {
             self.record_hook_error("fault", err);
@@ -953,7 +975,7 @@ where
 
 /// The `step` hook needs pre-execution stack and memory but also the instruction's cost, which
 /// is only known afterwards, so the two are bridged by copying rather than borrowing.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct PendingStep {
     stack: Vec<U256>,
     memory: MemorySnapshot,
@@ -1017,6 +1039,23 @@ const fn is_fault(result: InstructionResult) -> bool {
         // Everything else is raised while executing the instruction: REVERT, invalid jump,
         // undefined opcode, write protection, return-data overrun, and the create failures.
         _ => true,
+    }
+}
+
+/// The message geth gives `step` for an instruction it rejects while metering, before it runs.
+///
+/// geth's stack errors carry the sizes involved, so they are rebuilt here from the opcode's
+/// arity; the out-of-gas flavours read as they do elsewhere.
+fn pre_execution_error(result: InstructionResult, op: u8, stack_len: usize) -> Option<String> {
+    let arity = OpCode::new(op).map(|op| (op.inputs() as usize, op.outputs() as usize));
+    match (result, arity) {
+        (InstructionResult::StackUnderflow, Some((inputs, _))) => {
+            Some(format!("stack underflow ({stack_len} <=> {inputs})"))
+        }
+        (InstructionResult::StackOverflow, Some((inputs, outputs))) => {
+            Some(format!("stack limit reached {stack_len} ({})", STACK_LIMIT + inputs - outputs))
+        }
+        _ => utils::fmt_error_msg(result, TraceStyle::Geth),
     }
 }
 
@@ -2643,6 +2682,48 @@ mod tests {
         let (ctx, inspector) = evm.ctx_inspector();
         let res = inspector.json_result(res, ctx.tx(), ctx.block(), ctx.db_ref()).unwrap();
         assert_eq!(res, json!(["SSTORE 7", "SLOAD 42", "SELFDESTRUCT 17 0"]));
+    }
+
+    /// `fault` sees the log its instruction's `step` saw, as geth's `OnFault` reuses the one from
+    /// `OnOpcode`: the operands are still on the stack, and the gas and cost are from before.
+    #[test]
+    fn test_fault_sees_the_step_log_of_its_instruction() {
+        let code = r#"{faults: [], step: function() {},
+            fault: function(log) {
+                this.faults.push([log.op.toString(), log.getGas(), log.getCost(),
+                    log.stack.length(), log.stack.peek(0).toString(), log.getError()]);
+            },
+            result: function() { return this.faults }}"#;
+        // PUSH1 0xff, JUMP: an invalid jump destination.
+        let res = run_trace(code, Some(bytes!("60ff56")), false);
+        assert_eq!(res, json!([["JUMP", 978997, 8, 1, "255", "invalid jump destination"]]));
+
+        // Without a `step` hook there is no snapshot of the stack, but the gas is still the gas
+        // before the instruction.
+        let code = r#"{faults: [],
+            fault: function(log) { this.faults.push([log.op.toString(), log.getGas()]) },
+            result: function() { return this.faults }}"#;
+        let res = run_trace(code, Some(bytes!("60ff56")), false);
+        assert_eq!(res, json!([["JUMP", 978997]]));
+    }
+
+    /// An instruction rejected while metering hands its error to `step`, worded as geth words
+    /// it, and does not reach `fault`.
+    #[test]
+    fn test_step_reports_errors_raised_before_execution() {
+        let code = r#"{errors: [], faults: 0,
+            step: function(log) { var e = log.getError(); if (e) this.errors.push(e) },
+            fault: function() { this.faults++ },
+            result: function() { return [this.errors, this.faults] }}"#;
+        // ADD on an empty stack.
+        let res = run_trace(code, Some(bytes!("01")), false);
+        assert_eq!(res, json!([["stack underflow (0 <=> 2)"], 0]));
+        // 1025 PUSH0s: the last one overflows the stack.
+        let res = run_trace(code, Some(vec![0x5f; 1025].into()), false);
+        assert_eq!(res, json!([["stack limit reached 1024 (1023)"], 0]));
+        // PUSH1 with only 2 gas left after the intrinsic cost.
+        let res = run_trace_with_gas(code, Some(bytes!("6001")), false, 21_002);
+        assert_eq!(res, json!([["out of gas"], 0]));
     }
 
     /// Plain function recursion within the limit succeeds.
