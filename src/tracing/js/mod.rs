@@ -5,7 +5,7 @@ use crate::tracing::{
     js::{
         bindings::{
             CallFrame, Contract, EvmDbRef, FrameResult, GcGuard, JsEvmContext, MemoryRef,
-            MemorySnapshot, MemoryView, StackRef, StepLog,
+            MemorySnapshot, MemoryView, PreStepState, StackRef, StepLog,
         },
         builtins::{register_builtins, to_serde_value, PrecompileList},
     },
@@ -17,11 +17,12 @@ use alloc::{
     string::{String, ToString},
     vec::Vec,
 };
-use alloy_primitives::{Address, Bytes, U256};
+use alloy_primitives::{Address, Bytes, B256, U256};
 pub use boa_engine::vm::RuntimeLimits;
 use boa_engine::{js_string, Context, JsError, JsNativeError, JsObject, JsResult, JsValue, Source};
 use core::borrow::Borrow;
 use revm::{
+    bytecode::opcode,
     context::JournalTr,
     context_interface::{
         result::{ExecutionResult, HaltReasonTr, Output, ResultAndState},
@@ -580,9 +581,11 @@ where
             let mem = interp.memory.borrow();
             MemorySnapshot::record(op, interp.stack.data(), &mem.context_memory())
         };
+        let pre_state = capture_pre_state(op, interp, context);
         self.pending_step = Some(PendingStep {
             stack: interp.stack.data().clone(),
             memory,
+            pre_state,
             op,
             pc: interp.bytecode.pc() as u64,
             gas_remaining: interp.gas.remaining(),
@@ -612,8 +615,11 @@ where
             // Like the cost, the refund is read after the instruction: geth meters an SSTORE's
             // refund with its dynamic gas, before `OnOpcode`, so the step includes it.
             pending.refund = refunded_gas(interp, self.enclosing_refund());
-            let (db, _db_guard) =
-                EvmDbRef::new(context.journal_ref().evm_state(), context.db_ref());
+            let (db, _db_guard) = EvmDbRef::with_pre_state(
+                context.journal_ref().evm_state(),
+                context.db_ref(),
+                core::mem::take(&mut pending.pre_state),
+            );
             // Scoped so the guards and the memory borrow are released before `interp` is used
             // mutably below.
             let called = {
@@ -651,6 +657,7 @@ where
         let (step, _stack_guard, _memory_guard) = PendingStep {
             stack: interp.stack.data().clone(),
             memory: MemorySnapshot::unchanged(post_memory.len()),
+            pre_state: PreStepState::default(),
             op: self.last_start_step_op.unwrap_or_default(),
             pc: self.last_start_step_pc.unwrap_or_default() as u64,
             gas_remaining: interp.gas.remaining(),
@@ -902,12 +909,56 @@ pub enum JsInspectorError {
 
 /// A snapshot of the interpreter taken before an instruction runs.
 ///
+/// Records what `op` is about to change in the state, read before it runs. See [`PreStepState`].
+fn capture_pre_state<CTX>(op: u8, interp: &Interpreter, context: &mut CTX) -> PreStepState
+where
+    CTX: ContextTr<Journal: JournalExt, Db: DatabaseRef>,
+{
+    let mut pre_state = PreStepState::default();
+    // An empty stack means the instruction fails before it changes anything.
+    let Some(&top) = interp.stack.data().last() else {
+        return pre_state;
+    };
+    let target = interp.input.target_address;
+    let state = context.journal_ref().evm_state();
+    match op {
+        opcode::SSTORE => {
+            let value = match state.get(&target) {
+                Some(acc) => match acc.storage.get(&top) {
+                    Some(slot) => Some(slot.present_value()),
+                    None if acc.is_created() => Some(U256::ZERO),
+                    None => context.db_ref().storage_ref(target, top).ok(),
+                },
+                None => context.db_ref().storage_ref(target, top).ok(),
+            };
+            pre_state.slot = value.map(|value| (target, top, value));
+        }
+        opcode::SELFDESTRUCT => {
+            let beneficiary = Address::from_word(B256::from(top));
+            for address in [target, beneficiary] {
+                let info = match state.get(&address) {
+                    Some(acc) => Some(acc.info.clone()),
+                    None => match context.db_ref().basic_ref(address) {
+                        Ok(info) => info,
+                        Err(_) => continue,
+                    },
+                };
+                pre_state.accounts.push((address, info));
+            }
+        }
+        _ => {}
+    }
+    pre_state
+}
+
 /// The `step` hook needs pre-execution stack and memory but also the instruction's cost, which
 /// is only known afterwards, so the two are bridged by copying rather than borrowing.
 #[derive(Debug)]
 struct PendingStep {
     stack: Vec<U256>,
     memory: MemorySnapshot,
+    /// What the instruction is about to change in the state, for the `db` the hook is given.
+    pre_state: PreStepState,
     op: u8,
     pc: u64,
     gas_remaining: u64,
@@ -927,7 +978,8 @@ impl PendingStep {
         error: Option<String>,
         post_memory: &'a [u8],
     ) -> (StepLog, GcGuard<'a, Vec<U256>>, GcGuard<'a, MemoryView>) {
-        let Self { stack, memory, op, pc, gas_remaining, depth, refund, contract } = self;
+        let Self { stack, memory, op, pc, gas_remaining, depth, refund, contract, pre_state: _ } =
+            self;
         let (stack, stack_guard) = StackRef::new(stack);
         let (memory, memory_guard) = MemoryRef::new(memory, post_memory);
         let step = StepLog {
@@ -2542,6 +2594,55 @@ mod tests {
         let res = run_trace(code, Some(bytes!("602a60005560005400")), true);
         let word = format!("0x{:064x}", 0x2a);
         assert_eq!(res, json!([word, word]));
+    }
+
+    /// The `db` a step sees is the state before the instruction, as with geth's `OnOpcode`,
+    /// even though the hook only fires once the instruction has run.
+    #[test]
+    fn test_step_db_is_the_state_before_the_instruction() {
+        let contract_addr = Address::repeat_byte(0x01);
+        let mut db = CacheDB::new(EmptyDB::default());
+        db.insert_account_info(
+            Address::ZERO,
+            AccountInfo { balance: U256::from(1e18), ..Default::default() },
+        );
+        // PUSH1 0x2a, PUSH1 0, SSTORE, PUSH1 0, SLOAD, POP, PUSH1 0xcc, SELFDESTRUCT
+        db.insert_account_info(
+            contract_addr,
+            AccountInfo {
+                balance: U256::from(17),
+                code: Some(Bytecode::new_legacy(bytes!("602a6000556000545060ccff"))),
+                ..Default::default()
+            },
+        );
+        db.insert_account_storage(contract_addr, U256::ZERO, U256::from(7)).unwrap();
+
+        let code = r#"{seen: [],
+            step: function(log, db) {
+                var op = log.op.toString(), me = log.contract.getAddress();
+                if (op == "SSTORE" || op == "SLOAD")
+                    this.seen.push(op + " " + db.getState(me, toWord("0x00"))[31]);
+                if (op == "SELFDESTRUCT")
+                    this.seen.push(op + " " + db.getBalance(me) + " "
+                        + db.getBalance(toAddress("0x00000000000000000000000000000000000000cc")));
+            },
+            fault: function() {},
+            result: function() { return this.seen }}"#;
+        let insp = JsInspector::new(code.to_string(), serde_json::Value::Null).unwrap();
+        let mut evm = revm::Context::mainnet()
+            .modify_cfg_chained(|cfg| cfg.spec = SpecId::CANCUN)
+            .with_db(db)
+            .build_mainnet_with_inspector(insp);
+        let res = evm
+            .inspect_tx(TxEnv {
+                gas_limit: 1_000_000,
+                kind: TransactTo::Call(contract_addr),
+                ..Default::default()
+            })
+            .expect("pass without error");
+        let (ctx, inspector) = evm.ctx_inspector();
+        let res = inspector.json_result(res, ctx.tx(), ctx.block(), ctx.db_ref()).unwrap();
+        assert_eq!(res, json!(["SSTORE 7", "SLOAD 42", "SELFDESTRUCT 17 0"]));
     }
 
     /// Plain function recursion within the limit succeeds.

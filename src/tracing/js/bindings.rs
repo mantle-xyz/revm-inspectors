@@ -918,6 +918,21 @@ impl JsEvmContext {
     }
 }
 
+/// The state an instruction is about to change, captured before it runs.
+///
+/// The `step` hook fires after the instruction has run, once its cost is known, but has to see
+/// the state as it was before, like geth's `OnOpcode`. Within a single instruction revm changes
+/// state only for `SSTORE` (one slot) and `SELFDESTRUCT` (the balances it moves); calls and
+/// creations change it later, when the new frame starts. Recording those few values is enough
+/// to answer `db` reads as of before the instruction.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct PreStepState {
+    /// Accounts as they were, `None` if the account did not exist.
+    pub(crate) accounts: Vec<(Address, Option<AccountInfo>)>,
+    /// A storage slot and its value as it was.
+    pub(crate) slot: Option<(Address, U256, U256)>,
+}
+
 /// DB is the object that allows the js inspector to interact with the database.
 #[derive(Clone)]
 pub(crate) struct EvmDbRef {
@@ -927,6 +942,20 @@ pub(crate) struct EvmDbRef {
 impl EvmDbRef {
     /// Creates a new evm and db JS object.
     pub(crate) fn new<'a, 'b, DB>(state: &'a EvmState, db: &'b DB) -> (Self, EvmDbGuard<'a, 'b>)
+    where
+        DB: DatabaseRef,
+        DB::Error: core::fmt::Display,
+    {
+        Self::with_pre_state(state, db, PreStepState::default())
+    }
+
+    /// Like [`Self::new`], but answers reads of what `pre_state` covers from it, so the view is
+    /// the state before the instruction that `pre_state` was captured for.
+    pub(crate) fn with_pre_state<'a, 'b, DB>(
+        state: &'a EvmState,
+        db: &'b DB,
+        pre_state: PreStepState,
+    ) -> (Self, EvmDbGuard<'a, 'b>)
     where
         DB: DatabaseRef,
         DB::Error: core::fmt::Display,
@@ -949,7 +978,7 @@ impl EvmDbRef {
 
         let (db, db_guard) = GcDb::new(js_db);
 
-        let inner = EvmDbRefInner { state, db };
+        let inner = EvmDbRefInner { state, db, pre_state };
         let this = Self { inner: Rc::new(inner) };
         let guard = EvmDbGuard { _state_guard: state_guard, _db_guard: db_guard };
         (this, guard)
@@ -958,6 +987,9 @@ impl EvmDbRef {
     fn read_basic(&self, address: JsValue, ctx: &mut Context) -> JsResult<Option<AccountInfo>> {
         let buf = bytes_from_value(address, ctx)?;
         let address = bytes_to_address(&buf);
+        if let Some((_, acc)) = self.inner.pre_state.accounts.iter().find(|(a, _)| *a == address) {
+            return Ok(acc.clone());
+        }
         if let acc @ Some(_) = self.inner.state.get_account(&address) {
             return Ok(acc);
         }
@@ -1006,19 +1038,26 @@ impl EvmDbRef {
         let buf = bytes_from_value(slot, ctx)?;
         let slot = bytes_to_b256(&buf);
 
+        let slot = U256::from_be_bytes(slot.0);
+        if let Some((_, _, value)) =
+            self.inner.pre_state.slot.filter(|(a, s, _)| *a == address && *s == slot)
+        {
+            return to_uint8_array(B256::from(value), ctx);
+        }
         // geth reads the live state, so a slot this transaction has written reads back the
         // written value rather than the one committed before the transaction.
-        if let Some(value) = self.inner.state.get_storage(&address, slot.into()) {
+        if let Some(value) = self.inner.state.get_storage(&address, slot) {
             return to_uint8_array(B256::from(value), ctx);
         }
 
-        let res = self.inner.db.0.with_inner(|db| db.storage_ref(address, slot.into()));
+        let res = self.inner.db.0.with_inner(|db| db.storage_ref(address, slot));
 
         let value = match res {
             Some(Ok(value)) => value,
             _ => {
                 return Err(JsError::from_native(JsNativeError::error().with_message(format!(
-                    "Failed to read state for {address:?} at {slot:?} from database",
+                    "Failed to read state for {address:?} at {:?} from database",
+                    B256::from(slot)
                 ))))
             }
         };
@@ -1118,6 +1157,7 @@ unsafe impl Trace for EvmDbRef {
 struct EvmDbRefInner {
     state: StateRef,
     db: GcDb<Box<dyn DatabaseRef<Error = StringError> + 'static>>,
+    pre_state: PreStepState,
 }
 
 /// Guard the inner references, once this value is dropped the inner reference is also removed.
