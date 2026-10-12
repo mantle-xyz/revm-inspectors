@@ -7,7 +7,8 @@ use boa_engine::{
     js_string,
     object::builtins::{JsArray, JsArrayBuffer, JsTypedArray, JsUint8Array},
     property::PropertyDescriptor,
-    Context, JsArgs, JsError, JsNativeError, JsResult, JsString, JsValue, NativeFunction, Source,
+    Context, JsArgs, JsData, JsError, JsNativeError, JsResult, JsString, JsValue, NativeFunction,
+    Source,
 };
 use boa_gc::{empty_trace, Finalize, Trace};
 use core::borrow::Borrow;
@@ -99,10 +100,38 @@ fn define_bigint_global(ctx: &mut Context, name: &str, value: JsValue) -> JsResu
 
 /// Evaluates the library on first access and replaces the accessors with the constructor.
 fn bigint_lazy_getter(_this: &JsValue, _args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
-    let big_int = eval_bigint(ctx)?;
-    for name in BIG_INT_GLOBALS {
-        define_bigint_global(ctx, name, big_int.clone())?;
+    let big_int = bigint_constructor(ctx)?;
+    // Only the names still waiting for the library get it: one the script has already assigned
+    // holds the script's value, as an ordinary global would.
+    let pending = ctx.remove_data::<LazyBigIntGlobals>().map(|p| p.0).unwrap_or_default();
+    for (name, pending) in BIG_INT_GLOBALS.into_iter().zip(pending) {
+        if pending {
+            define_bigint_global(ctx, name, big_int.clone())?;
+        }
     }
+    Ok(big_int)
+}
+
+/// Which of [`BIG_INT_GLOBALS`] still hold the installing accessor rather than a value.
+#[derive(Debug, Finalize, JsData)]
+struct LazyBigIntGlobals([bool; 2]);
+
+unsafe impl Trace for LazyBigIntGlobals {
+    empty_trace!();
+}
+
+/// The library's constructor, held by the host so that conversions keep working whatever the
+/// script does to the globals, as geth holds it in a Go-side handle.
+#[derive(Debug, Trace, Finalize, JsData)]
+struct BigIntConstructor(JsValue);
+
+/// Returns the library's constructor, evaluating the library the first time it is needed.
+fn bigint_constructor(ctx: &mut Context) -> JsResult<JsValue> {
+    if let Some(BigIntConstructor(big_int)) = ctx.get_data::<BigIntConstructor>() {
+        return Ok(big_int.clone());
+    }
+    let big_int = eval_bigint(ctx)?;
+    ctx.insert_data(BigIntConstructor(big_int.clone()));
     Ok(big_int)
 }
 
@@ -116,6 +145,10 @@ fn bigint_lazy_setter(
     ctx: &mut Context,
 ) -> JsResult<JsValue> {
     // Only the assigned name is replaced; the sibling alias keeps its own binding.
+    if let Some(LazyBigIntGlobals(pending)) = ctx.remove_data::<LazyBigIntGlobals>().map(|p| *p) {
+        let pending = core::array::from_fn(|i| pending[i] && BIG_INT_GLOBALS[i] != *name);
+        ctx.insert_data(LazyBigIntGlobals(pending));
+    }
     define_bigint_global(ctx, name, args.get_or_undefined(0).clone())?;
     Ok(JsValue::undefined())
 }
@@ -124,6 +157,7 @@ fn bigint_lazy_setter(
 /// building the [`Context`], and a fresh one is built per traced transaction. Triggering on
 /// property access cannot miss a reference such as `globalThis['big' + 'Int']`.
 fn install_bigint(ctx: &mut Context) -> JsResult<()> {
+    ctx.insert_data(LazyBigIntGlobals([true; 2]));
     let getter = NativeFunction::from_fn_ptr(bigint_lazy_getter).to_js_function(ctx.realm());
     for name in BIG_INT_GLOBALS {
         let setter = NativeFunction::from_copy_closure_with_captures(bigint_lazy_setter, name)
@@ -281,20 +315,12 @@ pub(crate) fn bytes_to_fb<const N: usize>(mut bytes: &[u8]) -> FixedBytes<N> {
     FixedBytes::left_padding_from(bytes)
 }
 
-/// Converts a U256 to a bigint using the global bigint alias. The value is passed as a decimal
+/// Converts a U256 to a bigint with the library's constructor. The value is passed as a decimal
 /// string, matching geth, whose `toBig` is likewise handed `value.String()`; BigInteger.js
 /// accepts only decimal in its single-argument form, so a hex string would throw.
 pub(crate) fn to_bigint(value: U256, ctx: &mut Context) -> JsResult<JsValue> {
-    let bigint = ctx.global_object().get(js_string!("bigint"), ctx)?;
-    // Erroring beats `undefined`: this feeds `stack.peek()` and `db.getBalance()`, so a silent
-    // `undefined` yields a uniformly wrong trace. geth cannot hit this, holding the
-    // constructor as a Go-side handle rather than looking up a mutable global.
-    let bigint = bigint.as_callable().ok_or_else(|| {
-        JsError::from_native(
-            JsNativeError::typ()
-                .with_message("global `bigint` is not callable; it was overwritten"),
-        )
-    })?;
+    let bigint = bigint_constructor(ctx)?;
+    let bigint = bigint.as_callable().expect("eval_bigint returns a callable");
     bigint.call(&JsValue::undefined(), &[JsValue::from(js_string!(value.to_string()))], ctx)
 }
 
@@ -595,9 +621,15 @@ mod tests {
         register_builtins(&mut ctx).unwrap();
         let before = ctx.eval(Source::from_bytes(b"bigInt = 1; typeof bigInt")).unwrap();
         assert_eq!(before.to_string(&mut ctx).unwrap().to_std_string().unwrap(), "number");
-        // The sibling alias is independent, as two ordinary globals would be.
-        let alias = ctx.eval(Source::from_bytes(b"typeof bigint")).unwrap();
-        assert_eq!(alias.to_string(&mut ctx).unwrap().to_std_string().unwrap(), "function");
+        // The sibling alias is independent, as two ordinary globals would be: reading it
+        // installs the library for it alone and leaves the assigned one alone.
+        let alias = ctx.eval(Source::from_bytes(b"typeof bigint + ' ' + typeof bigInt")).unwrap();
+        assert_eq!(alias.to_string(&mut ctx).unwrap().to_std_string().unwrap(), "function number");
+        // Nor does a conversion the host makes, such as `stack.peek()`'s, disturb it.
+        let seven = to_bigint(U256::from(7u64), &mut ctx).unwrap();
+        assert_eq!(seven.to_string(&mut ctx).unwrap().to_std_string().unwrap(), "7");
+        let kept = ctx.eval(Source::from_bytes(b"bigInt")).unwrap();
+        assert_eq!(kept, JsValue::from(1));
 
         // After: the property is a data property and assignment still works.
         let mut ctx = Context::default();
@@ -611,6 +643,20 @@ mod tests {
         let mut ctx = Context::default();
         register_builtins(&mut ctx).unwrap();
         assert!(ctx.eval(Source::from_bytes(b"'use strict'; bigInt = 1;")).is_ok());
+    }
+
+    /// Conversions do not go through the globals, so overwriting both leaves them working, as
+    /// in geth.
+    #[test]
+    fn test_conversions_survive_overwritten_globals() {
+        let mut ctx = Context::default();
+        register_builtins(&mut ctx).unwrap();
+        ctx.eval(Source::from_bytes(b"bigInt = 123; bigint = null;")).unwrap();
+        let seven = to_bigint(U256::from(7u64), &mut ctx).unwrap();
+        assert_eq!(seven.to_string(&mut ctx).unwrap().to_std_string().unwrap(), "7");
+        let kept = ctx.eval(Source::from_bytes(b"[bigInt, bigint]")).unwrap();
+        let kept = kept.to_json(&mut ctx).unwrap().unwrap();
+        assert_eq!(kept, serde_json::json!([123, null]));
     }
 
     /// Touching the lowercase alias first must install the library just the same.
