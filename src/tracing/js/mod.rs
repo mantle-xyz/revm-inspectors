@@ -49,9 +49,15 @@ pub const LOOP_ITERATION_LIMIT: u64 = 200_000;
 /// The recursion limit for function calls.
 ///
 /// Once exceeded, the function will throw an error.
-/// Kept below Boa's default because recursive accessors also consume native stack space; a
-/// higher limit lets a tracer overflow the native stack and abort the process (upstream #548).
-pub const RECURSION_LIMIT: usize = 128;
+///
+/// A recursive property accessor (`{get x() {return this.x}}`) consumes native stack on every
+/// call, so the limit has to trip before the native stack overflows and aborts the process
+/// (upstream #548). Measured on a release build with a 2 MiB thread stack, an accessor overflows
+/// around 2,000 frames; 1,024 keeps a wide margin below that. Plain function recursion does not
+/// touch the native stack, so this bound only rejects genuinely deep recursion. go-ethereum's goja
+/// allows far deeper function recursion, so this is set well above upstream's conservative 128 to
+/// avoid rejecting tracer scripts that op-geth accepts, while still capping the accessor case.
+pub const RECURSION_LIMIT: usize = 1024;
 
 /// A javascript inspector that will delegate inspector functions to javascript functions
 ///
@@ -1839,8 +1845,8 @@ mod tests {
     #[test]
     fn test_result_and_setup_failures_are_single_line() {
         let code = r#"{step: function() {}, fault: function() {},
-            result: function() { function f(n) { return n ? 1 + f(n - 1) : 0 } return f(1000) }}"#;
-        let err = try_run_trace(code, None, None, 1_000_000).expect_err("deep recursion in result");
+            result: function() { while (true) {} }}"#;
+        let err = try_run_trace(code, None, None, 1_000_000).expect_err("loop limit in result");
         assert!(matches!(err, JsInspectorError::JsError(_)), "got {err:?}");
         let msg = err.to_string();
         assert!(msg.starts_with("RuntimeLimit: "), "{msg}");
@@ -2523,17 +2529,38 @@ mod tests {
         assert_eq!(inspector.ctx.runtime_limits().loop_iteration_limit(), LOOP_ITERATION_LIMIT);
     }
 
+    /// Plain function recursion deeper than upstream's 128 limit (but within ours) succeeds: unlike
+    /// a property accessor it is bounded by Boa's call-stack limit, not the native stack, and
+    /// go-ethereum's goja accepts far deeper function recursion. Run on a large stack so the debug
+    /// build, whose frames are several times larger than release, does not overflow at this depth.
+    #[test]
+    fn test_deep_function_recursion_within_limit_succeeds() {
+        std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                let code = r#"{step: function() {}, fault: function() {},
+                    result: function() { function f(n) { return n ? 1 + f(n - 1) : 0 } return f(500) }}"#;
+                let res = try_run_trace(code, None, None, 1_000_000).expect("deep recursion ok");
+                assert_eq!(res, serde_json::json!(500));
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
     #[test]
     fn test_accessor_recursion_limit() {
         // A recursive getter or setter recurses through native frames; the recursion limit must
-        // trip before the native stack overflows, which would abort the process. Run on a small
-        // stack so an unbounded recursion would overflow well within the test.
+        // trip before the native stack overflows, which would abort the process. The stack here is
+        // sized so that `RECURSION_LIMIT` frames fit comfortably - a debug frame is several times
+        // larger than the release frame the production limit is tuned for - so a passing run proves
+        // the limit, not the stack, stops the recursion.
         //
         // (Boa 0.21 cannot throw a runtime-limit error raised inside promise `.return()` thenable
         // machinery - it panics converting it to a JS value - so that exotic case, covered by
         // upstream #548 on Boa 0.22, is left out here.)
         std::thread::Builder::new()
-            .stack_size(2 * 1024 * 1024)
+            .stack_size(32 * 1024 * 1024)
             .spawn(|| {
                 for setup in [
                     "const obj = {get x() {return this.x;}}; obj.x;",
