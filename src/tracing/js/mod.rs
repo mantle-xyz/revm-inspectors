@@ -116,6 +116,8 @@ pub struct JsInspector {
     deadline: Option<Instant>,
     /// Instructions run since the deadline was last checked; see [`DEADLINE_CHECK_INTERVAL`].
     steps_since_deadline_check: u32,
+    /// Set once the EVM has been seen past the deadline, so every frame left halts at once.
+    past_deadline: bool,
     /// The terminal [`InstructionResult`] of the root call, captured when it exits. The halt
     /// reason handed to [`Self::result`] is a generic type whose `Debug` is a Rust type name, so
     /// `ctx.error` is built from this instead, via [`utils::fmt_error_msg`].
@@ -241,6 +243,7 @@ impl JsInspector {
             timeout: None,
             deadline: None,
             steps_since_deadline_check: 0,
+            past_deadline: false,
             root_instruction_result: None,
         })
     }
@@ -278,21 +281,23 @@ impl JsInspector {
     /// Whether the EVM should stop because the trace is past its deadline, like geth's
     /// `evm.Cancel()` on timeout. Called for every instruction whether or not the tracer has a
     /// `step` hook, since the EVM can otherwise run on long after the script has stopped.
+    ///
+    /// This is independent of which error the trace reports: a hook that has already thrown
+    /// keeps its error as the result, but the EVM still stops at the deadline. A throw at a
+    /// `CALL` or `CREATE` cannot halt its own frame, which is already handing over to the child.
     fn timed_out(&mut self) -> bool {
         let Some(deadline) = self.deadline else {
             return false;
         };
-        match self.hook_error {
-            Some(JsInspectorError::Timeout) => return true,
-            // A hook has already failed; that error is the one to report.
-            Some(_) => return false,
-            None => {}
+        if self.past_deadline || matches!(self.hook_error, Some(JsInspectorError::Timeout)) {
+            return true;
         }
         let check = self.steps_since_deadline_check == 0;
         self.steps_since_deadline_check =
             (self.steps_since_deadline_check + 1) % DEADLINE_CHECK_INTERVAL;
         if check && Instant::now() >= deadline {
-            self.hook_error = Some(JsInspectorError::Timeout);
+            self.past_deadline = true;
+            self.hook_error.get_or_insert(JsInspectorError::Timeout);
             return true;
         }
         false
@@ -2520,7 +2525,7 @@ mod tests {
         timeout: Duration,
     ) -> Result<serde_json::Value, JsInspectorError> {
         // PUSH1 1, PUSH1 1, STOP — three steps, so the step hook runs.
-        run_bytecode_with_timeout(code, hex!("6001600100").into(), timeout).0
+        run_bytecode_with_timeout(code, hex!("6001600100").into(), 1_000_000, timeout).0
     }
 
     /// Like [`run_trace_with_timeout`] on the given bytecode, also returning the gas the
@@ -2528,6 +2533,7 @@ mod tests {
     fn run_bytecode_with_timeout(
         code: &str,
         bytecode: Bytes,
+        gas_limit: u64,
         timeout: Duration,
     ) -> (Result<serde_json::Value, JsInspectorError>, u64) {
         let addr = Address::repeat_byte(0x01);
@@ -2551,7 +2557,7 @@ mod tests {
         let res = evm
             .inspect_tx(TxEnv {
                 gas_price: 1024,
-                gas_limit: 1_000_000,
+                gas_limit,
                 kind: TransactTo::Call(addr),
                 ..Default::default()
             })
@@ -2571,10 +2577,28 @@ mod tests {
             r#"{step:function(){},fault:function(){},result:function(){return 1}}"#,
             r#"{fault:function(){},result:function(){return 1}}"#,
         ] {
-            let (res, gas_used) = run_bytecode_with_timeout(code, looping.clone(), Duration::ZERO);
+            let (res, gas_used) =
+                run_bytecode_with_timeout(code, looping.clone(), 1_000_000, Duration::ZERO);
             assert!(matches!(res, Err(JsInspectorError::Timeout)), "{code}: got {res:?}");
             assert!(gas_used < 22_000, "{code}: ran on to use {gas_used} gas");
         }
+    }
+
+    /// A hook that threw at a `CALL` cannot halt its frame, which is already starting the child;
+    /// the deadline must still stop the child, while the trace reports the hook's error.
+    #[test]
+    fn test_timeout_stops_the_evm_after_a_hook_error() {
+        // The root calls itself with all its gas; the child (CALLER == ADDRESS) loops forever.
+        let code = bytes!("33301460" "0f57" "5f5f5f5f5f" "305af100" "5b600f56");
+        let tracer = r#"{step: function(log) { if (log.op.toString() == "CALL") throw new Error("boom") },
+            fault: function() {}, result: function() { return 1 }}"#;
+        let gas_limit = 30_000_000;
+        let (res, gas_used) =
+            run_bytecode_with_timeout(tracer, code, gas_limit, Duration::from_millis(50));
+        let err = res.unwrap_err();
+        assert!(err.to_string().starts_with("Error: boom"), "{err}");
+        // The whole loop takes seconds; 50 ms of it uses a small fraction of the gas.
+        assert!(gas_used < gas_limit / 2, "the child ran on to use {gas_used} gas");
     }
 
     #[test]
