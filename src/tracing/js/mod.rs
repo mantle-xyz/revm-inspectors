@@ -1306,6 +1306,22 @@ mod tests {
         assert_eq!(res["price"], json!(true), "gasPrice must memoize too");
     }
 
+    /// Assigning a lazy field before it was ever read keeps the assigned value, in sloppy and in
+    /// strict code, as it does for geth's plain properties.
+    #[test]
+    fn test_ctx_lazy_fields_take_an_assignment_before_any_read() {
+        let code = r#"{fault: function() {},
+            result: function(ctx) { ctx.value = 42; ctx.gasPrice = 7; return [ctx.value, ctx.gasPrice] }}"#;
+        assert_eq!(run_trace(code, None, true), json!([42, 7]));
+        let code = r#"{fault: function() {},
+            result: function(ctx) { "use strict"; ctx.value = 42; return ctx.value }}"#;
+        assert_eq!(run_trace(code, None, true), json!(42));
+        // A frozen ctx still reads.
+        let code = r#"{fault: function() {},
+            result: function(ctx) { Object.freeze(ctx); return ctx.value.toString() }}"#;
+        assert_eq!(run_trace(code, None, true), json!("0"));
+    }
+
     /// The selfdestruct frame must describe the destruction, not the enclosing call.
     ///
     /// geth emits `OnEnter(depth, SELFDESTRUCT, this, beneficiary, []byte{}, 0, balance)`, so

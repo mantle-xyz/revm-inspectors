@@ -791,8 +791,9 @@ impl CallFrame {
 }
 
 /// Defines `name` on `obj` as a big integer materialised on first read, since converting
-/// eagerly would evaluate the whole `bigInt` library per `result()` call. The accessor then
-/// becomes a writable data property, like the plain property go-ethereum exposes.
+/// eagerly would evaluate the whole `bigInt` library per `result()` call. A read or an assignment
+/// turns the accessor into a writable data property, like the plain property go-ethereum exposes,
+/// so assigning before ever reading keeps the assigned value.
 fn define_lazy_bigint(
     obj: &JsObject,
     name: &'static str,
@@ -801,28 +802,52 @@ fn define_lazy_bigint(
 ) -> JsResult<()> {
     let getter = NativeFunction::from_copy_closure(move |this, _args, ctx| {
         let big_int = to_bigint(value, ctx)?;
+        // A frozen object can no longer be redefined; it then just keeps answering through
+        // the accessor, as a frozen data property would keep its value.
+        if let Some(this) = this.as_object() {
+            let _ = this.define_property_or_throw(
+                JsString::from(name),
+                plain_property(big_int.clone()),
+                ctx,
+            );
+        }
+        Ok(big_int)
+    })
+    .to_js_function(ctx.realm());
+    let setter = NativeFunction::from_copy_closure(move |this, args, ctx| {
         if let Some(this) = this.as_object() {
             this.define_property_or_throw(
                 JsString::from(name),
-                PropertyDescriptor::builder()
-                    .value(big_int.clone())
-                    .writable(true)
-                    .enumerable(true)
-                    .configurable(true)
-                    .build(),
+                plain_property(args.get_or_undefined(0).clone()),
                 ctx,
             )?;
         }
-        Ok(big_int)
+        Ok(JsValue::undefined())
     })
     .to_js_function(ctx.realm());
 
     obj.define_property_or_throw(
         JsString::from(name),
-        PropertyDescriptor::builder().get(getter).enumerable(true).configurable(true).build(),
+        PropertyDescriptor::builder()
+            .get(getter)
+            .set(setter)
+            .enumerable(true)
+            .configurable(true)
+            .build(),
         ctx,
     )?;
     Ok(())
+}
+
+/// A writable, enumerable, configurable data property holding `value`: what a plain
+/// assignment creates.
+fn plain_property(value: JsValue) -> PropertyDescriptor {
+    PropertyDescriptor::builder()
+        .value(value)
+        .writable(true)
+        .enumerable(true)
+        .configurable(true)
+        .build()
 }
 
 /// The `ctx` object that represents the context in which the transaction is executed.
