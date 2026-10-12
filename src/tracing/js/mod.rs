@@ -55,6 +55,11 @@ pub const LOOP_ITERATION_LIMIT: u64 = 200_000;
 /// stack, the size of reth's tracing threads, well before 1024 frames and aborts the process.
 pub const RECURSION_LIMIT: usize = 128;
 
+/// How many instructions run between checks of the trace deadline. Reading the clock on every
+/// instruction would cost more than most instructions do; this bounds how far past the deadline
+/// execution can run to a few microseconds.
+const DEADLINE_CHECK_INTERVAL: u32 = 1024;
+
 /// A javascript inspector that will delegate inspector functions to javascript functions
 ///
 /// See also <https://geth.ethereum.org/docs/developers/evm-tracing/custom-tracer#custom-javascript-tracing>
@@ -109,6 +114,8 @@ pub struct JsInspector {
     /// The instant the current trace must stop by, derived from `timeout` when the inspector is
     /// built. Checked at every hook so a script running across many hooks is cut off once past it.
     deadline: Option<Instant>,
+    /// Instructions run since the deadline was last checked; see [`DEADLINE_CHECK_INTERVAL`].
+    steps_since_deadline_check: u32,
     /// The terminal [`InstructionResult`] of the root call, captured when it exits. The halt
     /// reason handed to [`Self::result`] is a generic type whose `Debug` is a Rust type name, so
     /// `ctx.error` is built from this instead, via [`utils::fmt_error_msg`].
@@ -233,6 +240,7 @@ impl JsInspector {
             hook_error: None,
             timeout: None,
             deadline: None,
+            steps_since_deadline_check: 0,
             root_instruction_result: None,
         })
     }
@@ -244,10 +252,10 @@ impl JsInspector {
 
     /// Sets a wall-clock limit for the trace and starts the clock now.
     ///
-    /// Once the limit passes, the next hook the EVM invokes stops the script and [`Self::result`]
-    /// reports `execution timeout`, matching go-ethereum's `debug_trace*` timeout. A script that
-    /// stays inside a single hook is not interrupted: Boa has no way to interrupt running code,
-    /// so the check can only run between hooks.
+    /// Once the limit passes, the script is not called again, the EVM halts within a few
+    /// instructions, and [`Self::result`] reports `execution timeout`, matching go-ethereum's
+    /// `debug_trace*` timeout. A script that stays inside a single hook is not interrupted: Boa
+    /// has no way to interrupt running code, so the check can only run between hooks.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
         self.deadline = Some(Instant::now() + timeout);
@@ -261,6 +269,29 @@ impl JsInspector {
             return true;
         }
         if self.deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            self.hook_error = Some(JsInspectorError::Timeout);
+            return true;
+        }
+        false
+    }
+
+    /// Whether the EVM should stop because the trace is past its deadline, like geth's
+    /// `evm.Cancel()` on timeout. Called for every instruction whether or not the tracer has a
+    /// `step` hook, since the EVM can otherwise run on long after the script has stopped.
+    fn timed_out(&mut self) -> bool {
+        let Some(deadline) = self.deadline else {
+            return false;
+        };
+        match self.hook_error {
+            Some(JsInspectorError::Timeout) => return true,
+            // A hook has already failed; that error is the one to report.
+            Some(_) => return false,
+            None => {}
+        }
+        let check = self.steps_since_deadline_check == 0;
+        self.steps_since_deadline_check =
+            (self.steps_since_deadline_check + 1) % DEADLINE_CHECK_INTERVAL;
+        if check && Instant::now() >= deadline {
             self.hook_error = Some(JsInspectorError::Timeout);
             return true;
         }
@@ -328,6 +359,8 @@ impl JsInspector {
         DB: DatabaseRef,
         <DB as DatabaseRef>::Error: core::fmt::Display,
     {
+        // Past the deadline the script is not run again, as geth interrupts it on timeout.
+        self.deadline_exceeded();
         // A hook that threw leaves the tracer's state half-built, so report the failure
         // instead of a trace that silently omits whatever the hook did not record. The error
         // is rebuilt rather than taken, so asking for the result twice answers the same way.
@@ -560,6 +593,14 @@ where
     CTX: ContextTr<Journal: JournalExt, Db: DatabaseRef>,
 {
     fn step(&mut self, interp: &mut Interpreter, context: &mut CTX) {
+        // Halting before the instruction runs ends the frame; each enclosing frame then halts at
+        // its next instruction, so the whole transaction unwinds promptly.
+        if self.timed_out() {
+            interp
+                .bytecode
+                .set_action(InterpreterAction::new_halt(InstructionResult::Revert, interp.gas));
+            return;
+        }
         // Recorded unconditionally: `step_end` reports these for a faulting instruction even
         // when the tracer has no `step` hook, which is what geth does.
         self.last_start_step_pc = Some(interp.bytecode.pc());
@@ -2462,6 +2503,17 @@ mod tests {
         code: &str,
         timeout: Duration,
     ) -> Result<serde_json::Value, JsInspectorError> {
+        // PUSH1 1, PUSH1 1, STOP — three steps, so the step hook runs.
+        run_bytecode_with_timeout(code, hex!("6001600100").into(), timeout).0
+    }
+
+    /// Like [`run_trace_with_timeout`] on the given bytecode, also returning the gas the
+    /// transaction used.
+    fn run_bytecode_with_timeout(
+        code: &str,
+        bytecode: Bytes,
+        timeout: Duration,
+    ) -> (Result<serde_json::Value, JsInspectorError>, u64) {
         let addr = Address::repeat_byte(0x01);
         let mut db = CacheDB::new(EmptyDB::default());
         db.insert_account_info(
@@ -2470,11 +2522,7 @@ mod tests {
         );
         db.insert_account_info(
             addr,
-            AccountInfo {
-                // PUSH1 1, PUSH1 1, STOP — three steps, so the step hook runs.
-                code: Some(Bytecode::new_legacy(hex!("6001600100").into())),
-                ..Default::default()
-            },
+            AccountInfo { code: Some(Bytecode::new_legacy(bytecode)), ..Default::default() },
         );
 
         let insp = JsInspector::new(code.to_string(), serde_json::Value::Null)
@@ -2492,8 +2540,25 @@ mod tests {
                 ..Default::default()
             })
             .expect("pass without error");
+        let gas_used = res.result.tx_gas_used();
         let (ctx, inspector) = evm.ctx_inspector();
-        inspector.json_result(res, ctx.tx(), ctx.block(), ctx.db_ref())
+        (inspector.json_result(res, ctx.tx(), ctx.block(), ctx.db_ref()), gas_used)
+    }
+
+    /// Past the deadline the EVM stops too, as geth cancels it, whether or not the tracer has a
+    /// `step` hook: otherwise an endless loop runs on until it exhausts its gas.
+    #[test]
+    fn test_timeout_stops_the_evm() {
+        // JUMPDEST, PUSH1 0, JUMP: loops until out of gas.
+        let looping = bytes!("5b600056");
+        for code in [
+            r#"{step:function(){},fault:function(){},result:function(){return 1}}"#,
+            r#"{fault:function(){},result:function(){return 1}}"#,
+        ] {
+            let (res, gas_used) = run_bytecode_with_timeout(code, looping.clone(), Duration::ZERO);
+            assert!(matches!(res, Err(JsInspectorError::Timeout)), "{code}: got {res:?}");
+            assert!(gas_used < 22_000, "{code}: ran on to use {gas_used} gas");
+        }
     }
 
     #[test]
