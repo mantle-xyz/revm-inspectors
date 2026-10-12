@@ -199,9 +199,14 @@ impl JsInspector {
             // "{}" when absent, so the documented `JSON.parse(config)` idiom works.
             let cfg = if config.is_null() { String::from("{}") } else { config.to_string() };
             let cfg = JsValue::from(js_string!(cfg));
-            setup_fn
-                .call(&(obj.clone().into()), core::slice::from_ref(&cfg), &mut ctx)
-                .map_err(JsInspectorError::SetupCallFailed)?;
+            let called =
+                setup_fn.call(&(obj.clone().into()), core::slice::from_ref(&cfg), &mut ctx);
+            if let Err(err) = called {
+                let suffix = "    in server-side tracer function 'setup'";
+                return Err(JsInspectorError::SetupCallFailed(with_message_suffix(
+                    err, suffix, &mut ctx,
+                )));
+            }
         }
 
         Ok(Self {
@@ -391,11 +396,16 @@ impl JsInspector {
         };
         let ctx = ctx.into_js_object(&mut self.ctx)?;
         let db = db.into_js_object(&mut self.ctx)?;
-        Ok(self.result_fn.call(
+        let called = self.result_fn.call(
             &(self.obj.clone().into()),
             &[ctx.into(), db.into()],
             &mut self.ctx,
-        )?)
+        );
+        // Report a throwing `result` the way a throwing hook is reported: one line, named.
+        called.map_err(|err| {
+            let suffix = "    in server-side tracer function 'result'";
+            JsInspectorError::JsError(with_message_suffix(err, suffix, &mut self.ctx))
+        })
     }
 
     /// Records the first error thrown by a tracer hook, tagged with the hook's name.
@@ -1821,6 +1831,31 @@ mod tests {
         );
         let msg = err.to_string();
         assert!(msg.starts_with("Error: boom    in server-side tracer function 'step'"), "{msg}");
+        assert!(!msg.contains('\n'), "{msg}");
+    }
+
+    /// `result` and `setup` failures are reported like hook failures: one line, led by the
+    /// thrown error's own kind and naming the function, without Boa's multi-line backtrace.
+    #[test]
+    fn test_result_and_setup_failures_are_single_line() {
+        let code = r#"{step: function() {}, fault: function() {},
+            result: function() { function f(n) { return n ? 1 + f(n - 1) : 0 } return f(1000) }}"#;
+        let err = try_run_trace(code, None, None, 1_000_000).expect_err("deep recursion in result");
+        assert!(matches!(err, JsInspectorError::JsError(_)), "got {err:?}");
+        let msg = err.to_string();
+        assert!(msg.starts_with("RuntimeLimit: "), "{msg}");
+        assert!(msg.contains("in server-side tracer function 'result'"), "{msg}");
+        assert!(!msg.contains('\n'), "{msg}");
+
+        let code = r#"{setup: function() { null.x }, step: function() {}, fault: function() {},
+            result: function() { return null }}"#;
+        let err = JsInspector::new(code.to_string(), serde_json::Value::Null)
+            .map(|_| ())
+            .expect_err("a throwing setup must fail");
+        assert!(matches!(err, JsInspectorError::SetupCallFailed(_)), "got {err:?}");
+        let msg = err.to_string();
+        assert!(msg.starts_with("failed to call setup(): TypeError: "), "{msg}");
+        assert!(msg.contains("in server-side tracer function 'setup'"), "{msg}");
         assert!(!msg.contains('\n'), "{msg}");
     }
 
