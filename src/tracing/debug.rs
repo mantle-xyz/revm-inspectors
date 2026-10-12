@@ -25,28 +25,85 @@ use thiserror::Error;
 #[cfg(feature = "js-tracer")]
 const DEFAULT_JS_TRACER_TIMEOUT: core::time::Duration = core::time::Duration::from_secs(5);
 
-/// Parses a single-term Go duration such as `"5s"`, `"1.5s"`, `"200ms"` or `"2m"`, the form
-/// `debug_trace*`'s `timeout` takes. Returns `None` for anything it does not recognise, including
-/// the compound form (`"1m30s"`), so the caller can fall back to a default.
+/// Parses a duration the way Go's `time.ParseDuration` does, the form `debug_trace*`'s `timeout`
+/// takes: an optional sign, then one or more decimal numbers each with a unit (`ns`,
+/// `us`/`µs`/`μs`, `ms`, `s`, `m`, `h`), as in `"1m30s"` or `"1.5h"`; a bare `"0"` is also
+/// accepted. Returns `None` for anything Go rejects. A negative duration has already expired, so it
+/// comes back as zero.
 #[cfg(feature = "js-tracer")]
 fn parse_go_duration(s: &str) -> Option<core::time::Duration> {
-    let s = s.trim();
-    let unit_start = s.find(|c: char| c.is_ascii_alphabetic())?;
-    let (value, unit) = s.split_at(unit_start);
-    let value: f64 = value.parse().ok()?;
-    if !value.is_finite() || value < 0.0 {
+    // Go's limit: the magnitude of an `int64` count of nanoseconds.
+    const MAX_NANOS: u128 = 1 << 63;
+
+    let (negative, mut rest) = match s.as_bytes().first() {
+        Some(b'-') => (true, &s[1..]),
+        Some(b'+') => (false, &s[1..]),
+        _ => (false, s),
+    };
+    if rest == "0" {
+        return Some(core::time::Duration::ZERO);
+    }
+    if rest.is_empty() {
         return None;
     }
-    let nanos_per_unit = match unit {
-        "ns" => 1.0,
-        "us" | "µs" | "μs" => 1_000.0,
-        "ms" => 1_000_000.0,
-        "s" => 1_000_000_000.0,
-        "m" => 60_000_000_000.0,
-        "h" => 3_600_000_000_000.0,
-        _ => return None,
-    };
-    Some(core::time::Duration::from_nanos((value * nanos_per_unit) as u64))
+
+    let mut total: u128 = 0;
+    while !rest.is_empty() {
+        // The integer part, then an optional fraction; at least one digit overall.
+        let int_len = rest.bytes().take_while(u8::is_ascii_digit).count();
+        let (int_digits, after) = rest.split_at(int_len);
+        let (frac_digits, after) = match after.strip_prefix('.') {
+            Some(after) => {
+                let frac_len = after.bytes().take_while(u8::is_ascii_digit).count();
+                after.split_at(frac_len)
+            }
+            None => ("", after),
+        };
+        if int_digits.is_empty() && frac_digits.is_empty() {
+            return None;
+        }
+
+        // The unit runs up to the next number.
+        let unit_len = after.find(|c: char| c == '.' || c.is_ascii_digit()).unwrap_or(after.len());
+        let (unit, after) = after.split_at(unit_len);
+        let nanos_per_unit: u128 = match unit {
+            "ns" => 1,
+            "us" | "µs" | "μs" => 1_000,
+            "ms" => 1_000_000,
+            "s" => 1_000_000_000,
+            "m" => 60_000_000_000,
+            "h" => 3_600_000_000_000,
+            _ => return None,
+        };
+
+        let mut int_part: u128 = 0;
+        for digit in int_digits.bytes() {
+            int_part = int_part * 10 + u128::from(digit - b'0');
+            if int_part > MAX_NANOS {
+                return None;
+            }
+        }
+        // Like Go, digits past what can matter are dropped rather than rejected.
+        let (mut frac, mut scale) = (0u128, 1u128);
+        for digit in frac_digits.bytes().take(18) {
+            frac = frac * 10 + u128::from(digit - b'0');
+            scale *= 10;
+        }
+
+        total += int_part.checked_mul(nanos_per_unit)? + frac * nanos_per_unit / scale;
+        if total > MAX_NANOS {
+            return None;
+        }
+        rest = after;
+    }
+
+    if negative {
+        return Some(core::time::Duration::ZERO);
+    }
+    if total == MAX_NANOS {
+        return None;
+    }
+    Some(core::time::Duration::from_nanos(total as u64))
 }
 
 /// Inspector for the `debug` API
@@ -189,12 +246,12 @@ impl DebugInspector {
                 GethDebugTracerType::JsTracer(code) => {
                     let config = tracer_config.into_json();
                     // go-ethereum applies a five-second timeout to JS tracers unless the request
-                    // overrides it; a malformed override falls back to that default rather than
-                    // running unbounded.
-                    let timeout = timeout
-                        .as_deref()
-                        .and_then(parse_go_duration)
-                        .unwrap_or(DEFAULT_JS_TRACER_TIMEOUT);
+                    // overrides it, and rejects an override it cannot parse.
+                    let timeout = match timeout.as_deref() {
+                        Some(timeout) => parse_go_duration(timeout)
+                            .ok_or(DebugInspectorError::InvalidTracerConfig)?,
+                        None => DEFAULT_JS_TRACER_TIMEOUT,
+                    };
                     let inspector =
                         crate::tracing::js::JsInspector::new(code, config)?.with_timeout(timeout);
                     Self::Js(inspector.into())
@@ -424,26 +481,76 @@ pub enum DebugInspectorError<DBError = core::convert::Infallible> {
 
 #[cfg(all(test, feature = "js-tracer"))]
 mod tests {
-    use super::parse_go_duration;
+    use super::{parse_go_duration, DebugInspector, DebugInspectorError};
+    use alloy_rpc_types_trace::geth::{GethDebugTracerType, GethDebugTracingOptions};
     use core::time::Duration;
 
+    /// A `timeout` that does not parse is rejected, as geth rejects it, instead of being replaced
+    /// by the default.
     #[test]
-    fn parses_single_term_go_durations() {
+    fn rejects_an_unparseable_timeout() {
+        let opts = |timeout: &str| GethDebugTracingOptions {
+            tracer: Some(GethDebugTracerType::JsTracer(
+                "{fault: function() {}, result: function() {}}".into(),
+            )),
+            timeout: Some(timeout.into()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            DebugInspector::new(opts("nonsense")),
+            Err(DebugInspectorError::InvalidTracerConfig)
+        ));
+        assert!(DebugInspector::new(opts("1m30s")).is_ok());
+    }
+
+    #[test]
+    fn parses_go_durations() {
         assert_eq!(parse_go_duration("5s"), Some(Duration::from_secs(5)));
         assert_eq!(parse_go_duration("200ms"), Some(Duration::from_millis(200)));
         assert_eq!(parse_go_duration("2m"), Some(Duration::from_secs(120)));
         assert_eq!(parse_go_duration("1.5s"), Some(Duration::from_millis(1500)));
+        assert_eq!(parse_go_duration(".5s"), Some(Duration::from_millis(500)));
+        assert_eq!(parse_go_duration("1.s"), Some(Duration::from_secs(1)));
+        assert_eq!(parse_go_duration("+3s"), Some(Duration::from_secs(3)));
+        // The forms Go's `Duration.String()` itself produces.
+        assert_eq!(parse_go_duration("1m30s"), Some(Duration::from_secs(90)));
+        assert_eq!(parse_go_duration("1h2m3.5s"), Some(Duration::from_millis(3_723_500)));
         assert_eq!(parse_go_duration("100us"), Some(Duration::from_micros(100)));
-        assert_eq!(parse_go_duration(" 3s "), Some(Duration::from_secs(3)));
+        assert_eq!(parse_go_duration("100µs"), Some(Duration::from_micros(100)));
+        assert_eq!(parse_go_duration("100μs"), Some(Duration::from_micros(100)));
+        assert_eq!(parse_go_duration("0"), Some(Duration::ZERO));
+        assert_eq!(parse_go_duration("0s"), Some(Duration::ZERO));
+        assert_eq!(parse_go_duration("-0"), Some(Duration::ZERO));
+        assert_eq!(parse_go_duration("+0"), Some(Duration::ZERO));
+        assert_eq!(parse_go_duration("1.0000000000000000000001s"), Some(Duration::from_secs(1)));
+        assert_eq!(
+            parse_go_duration("9223372036854775807ns"),
+            Some(Duration::from_nanos(i64::MAX as u64))
+        );
+        // Already expired.
+        assert_eq!(parse_go_duration("-1s"), Some(Duration::ZERO));
+        assert_eq!(
+            parse_go_duration("2562047h47m16.854775807s"),
+            Some(Duration::from_nanos(i64::MAX as u64))
+        );
     }
 
     #[test]
-    fn rejects_unparseable_durations() {
-        assert_eq!(parse_go_duration("1m30s"), None); // compound not supported
-        assert_eq!(parse_go_duration("abc"), None);
-        assert_eq!(parse_go_duration("10"), None); // missing unit
-        assert_eq!(parse_go_duration("10x"), None); // unknown unit
-        assert_eq!(parse_go_duration("-1s"), None);
-        assert_eq!(parse_go_duration(""), None);
+    fn rejects_what_go_rejects() {
+        for s in [
+            "",
+            "abc",
+            "10",
+            "10x",
+            "s",
+            ".s",
+            "-",
+            " 3s ",
+            "1m30",
+            "2562047h47m16.854775808s",
+            "9223372036854775808ns",
+        ] {
+            assert_eq!(parse_go_duration(s), None, "{s:?}");
+        }
     }
 }
