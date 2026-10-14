@@ -378,7 +378,7 @@ impl JsInspector {
         }
 
         let ResultAndState { result, state } = res;
-        let (db, _db_guard) = EvmDbRef::new(&state, db);
+        let (db, _db_guard) = EvmDbRef::finalised(&state, db);
 
         let gas_used = result.tx_gas_used();
         let mut to = None;
@@ -2765,6 +2765,46 @@ mod tests {
         let res = run_trace(code, Some(bytes!("602a60005560005400")), true);
         let word = format!("0x{:064x}", 0x2a);
         assert_eq!(res, json!([word, word]));
+    }
+
+    /// In `result`, an account the transaction created and destroyed is gone, as geth's
+    /// `Finalise` deletes it before `GetResult`. A step inside the transaction still sees its
+    /// storage, as geth's live state does.
+    #[test]
+    fn test_result_db_drops_an_account_destroyed_in_the_transaction() {
+        let mut db = CacheDB::new(EmptyDB::default());
+        db.insert_account_info(
+            Address::ZERO,
+            AccountInfo { balance: U256::from(1e18), ..Default::default() },
+        );
+        let code = r#"{seen: [],
+            step: function(log, db) {
+                if (log.op.toString() == "SELFDESTRUCT")
+                    this.seen.push(toHex(db.getState(log.contract.getAddress(), toWord("0x00"))));
+            },
+            fault: function() {},
+            result: function(ctx, db) {
+                this.seen.push(toHex(db.getState(ctx.to, toWord("0x00"))), db.getNonce(ctx.to));
+                return this.seen;
+            }}"#;
+        let insp = JsInspector::new(code.to_string(), serde_json::Value::Null).unwrap();
+        let mut evm = revm::Context::mainnet()
+            .modify_cfg_chained(|cfg| cfg.spec = SpecId::CANCUN)
+            .with_db(db)
+            .build_mainnet_with_inspector(insp);
+        // Init code: PUSH1 0x2a, PUSH1 0, SSTORE, PUSH1 0xcc, SELFDESTRUCT
+        let res = evm
+            .inspect_tx(TxEnv {
+                gas_limit: 1_000_000,
+                kind: TransactTo::Create,
+                data: bytes!("602a60005560ccff"),
+                ..Default::default()
+            })
+            .expect("pass without error");
+        assert!(res.result.is_success());
+        let (ctx, inspector) = evm.ctx_inspector();
+        let res = inspector.json_result(res, ctx.tx(), ctx.block(), ctx.db_ref()).unwrap();
+        assert_eq!(res, json!([format!("0x{:064x}", 0x2a), format!("0x{:064x}", 0), 0]));
     }
 
     /// The `db` a step sees is the state before the instruction, as with geth's `OnOpcode`,

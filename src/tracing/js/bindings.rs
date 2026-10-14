@@ -441,17 +441,29 @@ unsafe impl Trace for MemoryRef {
 
 /// Represents the state object
 #[derive(Clone, Debug)]
-pub(crate) struct StateRef(GuardedNullableGc<EvmState>);
+pub(crate) struct StateRef {
+    state: GuardedNullableGc<EvmState>,
+    /// Whether the transaction is over, so a self-destructed account is gone, as geth's
+    /// `Finalise` deletes it. Until then it keeps its code, nonce and storage.
+    finalised: bool,
+}
 
 impl StateRef {
     /// Creates a new stack reference
-    pub(crate) fn new(state: &EvmState) -> (Self, GcGuard<'_, EvmState>) {
+    pub(crate) fn new(state: &EvmState, finalised: bool) -> (Self, GcGuard<'_, EvmState>) {
         let (inner, guard) = GuardedNullableGc::new_ref(state);
-        (Self(inner), guard)
+        (Self { state: inner, finalised }, guard)
     }
 
     fn get_account(&self, address: &Address) -> Option<AccountInfo> {
-        self.0.with_inner(|state| state.get(address).map(|acc| acc.info.clone()))?
+        self.state.with_inner(|state| {
+            let acc = state.get(address)?;
+            Some(if self.finalised && acc.is_selfdestructed() {
+                AccountInfo::default()
+            } else {
+                acc.info.clone()
+            })
+        })?
     }
 
     /// The slot's value as the transaction has left it so far, or `None` if the transaction has
@@ -459,8 +471,11 @@ impl StateRef {
     /// starts with empty storage, so its untouched slots are zero rather than whatever the
     /// database has for that address.
     fn get_storage(&self, address: &Address, slot: U256) -> Option<U256> {
-        self.0.with_inner(|state| {
+        self.state.with_inner(|state| {
             let acc = state.get(address)?;
+            if self.finalised && acc.is_selfdestructed() {
+                return Some(U256::ZERO);
+            }
             acc.storage
                 .get(&slot)
                 .map(|slot| slot.present_value())
@@ -974,6 +989,20 @@ impl EvmDbRef {
         Self::with_pre_state(state, db, PreStepState::default())
     }
 
+    /// Like [`Self::new`], but for the state the transaction has left behind: an account it
+    /// self-destructed reads as absent, as it does to geth's `GetResult`, which runs after
+    /// `Finalise` has deleted it.
+    pub(crate) fn finalised<'a, 'b, DB>(
+        state: &'a EvmState,
+        db: &'b DB,
+    ) -> (Self, EvmDbGuard<'a, 'b>)
+    where
+        DB: DatabaseRef,
+        DB::Error: core::fmt::Display,
+    {
+        Self::build(state, db, PreStepState::default(), true)
+    }
+
     /// Like [`Self::new`], but answers reads of what `pre_state` covers from it, so the view is
     /// the state before the instruction that `pre_state` was captured for.
     pub(crate) fn with_pre_state<'a, 'b, DB>(
@@ -985,7 +1014,20 @@ impl EvmDbRef {
         DB: DatabaseRef,
         DB::Error: core::fmt::Display,
     {
-        let (state, state_guard) = StateRef::new(state);
+        Self::build(state, db, pre_state, false)
+    }
+
+    fn build<'a, 'b, DB>(
+        state: &'a EvmState,
+        db: &'b DB,
+        pre_state: PreStepState,
+        finalised: bool,
+    ) -> (Self, EvmDbGuard<'a, 'b>)
+    where
+        DB: DatabaseRef,
+        DB::Error: core::fmt::Display,
+    {
+        let (state, state_guard) = StateRef::new(state, finalised);
 
         // SAFETY:
         //
