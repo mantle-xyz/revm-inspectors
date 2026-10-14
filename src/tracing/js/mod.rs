@@ -1089,6 +1089,8 @@ const fn is_fault(result: InstructionResult) -> bool {
         // `ErrGasUintOverflow`.
         StackUnderflow | StackOverflow | OutOfGas | MemoryOOG | MemoryLimitOOG | PrecompileOOG
         | InvalidOperandOOG | ReentrancySentryOOG => false,
+        // geth checks the CREATE initcode size in the instruction's dynamic gas function.
+        CreateInitCodeSizeLimit => false,
         // Everything else is raised while executing the instruction: REVERT, invalid jump,
         // undefined opcode, write protection, return-data overrun, and the create failures.
         _ => true,
@@ -2896,6 +2898,21 @@ mod tests {
         // PUSH1 with only 2 gas left after the intrinsic cost.
         let res = run_trace_with_gas(code, Some(bytes!("6001")), false, 21_002);
         assert_eq!(res, json!([["out of gas"], 0]));
+    }
+
+    /// An oversized CREATE initcode is rejected while metering: geth checks the size in the
+    /// dynamic gas function, before `OnOpcode`, and wraps the error in `ErrOutOfGas`. So `step`
+    /// gets the error and `fault` does not fire.
+    #[test]
+    fn test_step_reports_oversized_create_initcode() {
+        let code = r#"{errors: [], faults: 0,
+            step: function(log) { var e = log.getError(); if (e) this.errors.push(e) },
+            fault: function() { this.faults++ },
+            result: function(ctx) { return [this.errors, this.faults, ctx.error] }}"#;
+        // PUSH2 0xc001, PUSH1 0, PUSH1 0, CREATE, STOP: 49153 bytes, one over the limit.
+        let res = run_trace(code, Some(bytes!("61c00160006000f000")), false);
+        let err = "out of gas: max initcode size exceeded";
+        assert_eq!(res, json!([[err], 0, err]));
     }
 
     /// Plain function recursion within the limit succeeds.

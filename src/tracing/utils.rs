@@ -93,10 +93,14 @@ pub(crate) fn fmt_error_msg(res: InstructionResult, kind: TraceStyle) -> Option<
         InstructionResult::CreateContractSizeLimit => {
             if kind.is_parity() { "Out of bounds" } else { "max code size exceeded" }.to_string()
         }
-        InstructionResult::CreateInitCodeSizeLimit => {
-            if kind.is_parity() { "Out of bounds" } else { "max initcode size exceeded" }
-                .to_string()
+        // Only a CREATE raises this, and geth checks it while metering, which wraps the error
+        // in `ErrOutOfGas`.
+        InstructionResult::CreateInitCodeSizeLimit => if kind.is_parity() {
+            "Out of bounds"
+        } else {
+            "out of gas: max initcode size exceeded"
         }
+        .to_string(),
         InstructionResult::CreateContractStartingWithEF
         | InstructionResult::CreateInitCodeStartingEF00 => if kind.is_parity() {
             "Bad instruction"
