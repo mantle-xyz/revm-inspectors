@@ -31,8 +31,8 @@ use revm::{
     inspector::JournalExt,
     interpreter::{
         interpreter_types::{Jumps, LoopControl},
-        CallInputs, CallOutcome, CallScheme, CreateInputs, CreateOutcome, Gas, InstructionResult,
-        Interpreter, InterpreterAction, InterpreterResult, STACK_LIMIT,
+        CallInputs, CallOutcome, CallScheme, CreateInputs, CreateOutcome, FrameInput, Gas,
+        InstructionResult, Interpreter, InterpreterAction, InterpreterResult, STACK_LIMIT,
     },
     DatabaseRef, Inspector,
 };
@@ -661,7 +661,14 @@ where
         // The instruction has run, so its cost is now the difference in remaining gas. geth
         // reports this from `OnOpcode`, which it emits after metering but before executing.
         if let Some(mut pending) = self.pending_step.take() {
-            let cost = pending.gas_remaining.saturating_sub(interp.gas.remaining());
+            let mut cost = pending.gas_remaining.saturating_sub(interp.gas.remaining());
+            // revm charges the gas a CREATE forwards to the new frame inside the instruction,
+            // geth only in `opCreate`, after `OnOpcode`; CALL's forwarded gas geth meters itself.
+            if let Some(InterpreterAction::NewFrame(FrameInput::Create(inputs))) =
+                interp.bytecode.action().as_ref()
+            {
+                cost = cost.saturating_sub(inputs.gas_limit());
+            }
             // Like the cost, the refund is read after the instruction: geth meters an SSTORE's
             // refund with its dynamic gas, before `OnOpcode`, so the step includes it.
             pending.refund = refunded_gas(interp, self.enclosing_refund());
@@ -2442,6 +2449,26 @@ mod tests {
             res.as_array().unwrap().iter().map(|v| v.as_u64().unwrap_or(0)).collect::<Vec<u64>>(),
             vec![3, 3, 0]
         );
+    }
+
+    /// `getCost()` of CREATE and CREATE2 excludes the gas forwarded to the new frame. geth
+    /// charges the forwarded gas inside `opCreate`, after `OnOpcode`; revm charges it inside the
+    /// instruction, so the difference in remaining gas overstates the cost.
+    #[test]
+    fn test_create_cost_excludes_forwarded_gas() {
+        let code = r#"{costs: [],
+            step: function(log) {
+                var op = log.op.toString();
+                if (op == "CREATE" || op == "CREATE2") this.costs.push(log.getCost());
+            },
+            fault: function() {},
+            result: function() { return this.costs }}"#;
+        // PUSH1 0x20, PUSH1 0, PUSH1 0, CREATE, POP,
+        // PUSH1 0, PUSH1 0x20, PUSH1 0, PUSH1 0, CREATE2, STOP.
+        // CREATE: 32000 + 3 to expand memory by a word + 2 per initcode word.
+        // CREATE2: 32000 + 2 per initcode word + 6 per hashed word; memory is already expanded.
+        let res = run_trace(code, Some(bytes!("602060006000f0506000602060006000f500")), true);
+        assert_eq!(res, json!([32005, 32008]));
     }
 
     #[test]
