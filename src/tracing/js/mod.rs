@@ -1302,7 +1302,7 @@ mod tests {
 
     /// The lazily-defined `ctx` fields must be indistinguishable from ordinary properties:
     /// geth assigns them directly, so reading one twice gives the same object and assigning
-    /// sticks. The deferring accessor has to replace itself on first read to preserve both.
+    /// sticks.
     #[test]
     fn test_ctx_lazy_fields_behave_as_plain_properties() {
         let code = r#"{
@@ -1318,6 +1318,20 @@ mod tests {
         assert_eq!(res["same"], json!(true), "reading twice must yield the same object");
         assert_eq!(res["assigned"], json!(42), "the field must be writable");
         assert_eq!(res["price"], json!(true), "gasPrice must memoize too");
+    }
+
+    /// The lazy `ctx` fields keep reading and taking assignments when the same expression
+    /// touches them again, as in a loop.
+    #[test]
+    fn test_ctx_lazy_fields_from_the_same_expression() {
+        let code = r#"{fault: function() {},
+            result: function(ctx) {
+                var r = [];
+                for (var i = 0; i < 2; i++) r.push(ctx.value.toString(), ctx.gasPrice.toString());
+                for (var i = 0; i < 2; i++) { ctx.value = i; r.push(ctx.value) }
+                return r;
+            }}"#;
+        assert_eq!(run_trace(code, None, true), json!(["0", "1024", "0", "1024", 0, 1]));
     }
 
     /// Assigning a lazy field before it was ever read keeps the assigned value, in sloppy and in
@@ -2451,6 +2465,18 @@ mod tests {
             res.as_array().unwrap().iter().map(|v| v.as_u64().unwrap_or(0)).collect::<Vec<u64>>(),
             vec![3, 3, 0]
         );
+    }
+
+    /// `bigInt` keeps working when the same expression calls it again in a later step, as
+    /// geth's bundled `call_tracer_legacy.js` does once per returning CREATE or CALL.
+    #[test]
+    fn test_bigint_callable_again_from_the_same_expression() {
+        let code = r#"{res: [],
+            step: function() { this.res.push(bigInt(1).toString()) },
+            fault: function() {},
+            result: function() { return this.res }}"#;
+        let res = run_trace(code, None, true);
+        assert_eq!(res, json!(["1", "1", "1"]));
     }
 
     /// `getCost()` of CREATE and CREATE2 excludes the gas forwarded to the new frame. geth

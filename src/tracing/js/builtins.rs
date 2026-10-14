@@ -68,8 +68,8 @@ pub(crate) fn json_stringify(val: JsValue, ctx: &mut Context) -> JsResult<JsStri
 /// See `src/tracing/js/bigint.js` for provenance.
 const BIG_INT_JS: &str = include_str!("bigint.js");
 
-/// The global names the constructor is reachable under: `bigInt` is geth's, `bigint` is the
-/// alias [`to_bigint`] looks up. Both resolve to the same object.
+/// The global names the constructor is reachable under: `bigInt` is geth's, `bigint` an alias.
+/// Both resolve to the same object.
 const BIG_INT_GLOBALS: [&str; 2] = ["bigInt", "bigint"];
 
 /// Parses and evaluates the library, returning its constructor. The IIFE keeps its top-level
@@ -86,38 +86,37 @@ fn eval_bigint(ctx: &mut Context) -> JsResult<JsValue> {
     Ok(big_int)
 }
 
-/// Replaces a global with a plain writable data property holding `value`.
-fn define_bigint_global(ctx: &mut Context, name: &str, value: JsValue) -> JsResult<()> {
-    let desc = PropertyDescriptor::builder()
-        .value(value)
-        .writable(true)
-        .enumerable(true)
-        .configurable(true)
-        .build();
-    ctx.global_object().define_property_or_throw(JsString::from(name), desc, ctx)?;
-    Ok(())
-}
+/// What each of [`BIG_INT_GLOBALS`] holds once the script has assigned it; `None` until then,
+/// which reads as the library's constructor.
+#[derive(Debug, Default, Trace, Finalize, JsData)]
+struct BigIntGlobals([Option<JsValue>; 2]);
 
-/// Evaluates the library on first access and replaces the accessors with the constructor.
-fn bigint_lazy_getter(_this: &JsValue, _args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
-    let big_int = bigint_constructor(ctx)?;
-    // Only the names still waiting for the library get it: one the script has already assigned
-    // holds the script's value, as an ordinary global would.
-    let pending = ctx.remove_data::<LazyBigIntGlobals>().map(|p| p.0).unwrap_or_default();
-    for (name, pending) in BIG_INT_GLOBALS.into_iter().zip(pending) {
-        if pending {
-            define_bigint_global(ctx, name, big_int.clone())?;
-        }
+/// Reads one of [`BIG_INT_GLOBALS`]: the script's value if it assigned one, else the library's
+/// constructor, evaluating the library on first access.
+fn bigint_global_getter(
+    _this: &JsValue,
+    _args: &[JsValue],
+    index: &usize,
+    ctx: &mut Context,
+) -> JsResult<JsValue> {
+    if let Some(value) = ctx.get_data::<BigIntGlobals>().and_then(|g| g.0[*index].clone()) {
+        return Ok(value);
     }
-    Ok(big_int)
+    bigint_constructor(ctx)
 }
 
-/// Which of [`BIG_INT_GLOBALS`] still hold the installing accessor rather than a value.
-#[derive(Debug, Finalize, JsData)]
-struct LazyBigIntGlobals([bool; 2]);
-
-unsafe impl Trace for LazyBigIntGlobals {
-    empty_trace!();
+/// Assigns one of [`BIG_INT_GLOBALS`]; the sibling alias keeps its own value, as two ordinary
+/// globals would.
+fn bigint_global_setter(
+    _this: &JsValue,
+    args: &[JsValue],
+    index: &usize,
+    ctx: &mut Context,
+) -> JsResult<JsValue> {
+    let mut globals = ctx.remove_data::<BigIntGlobals>().map(|g| *g).unwrap_or_default();
+    globals.0[*index] = Some(args.get_or_undefined(0).clone());
+    ctx.insert_data(globals);
+    Ok(JsValue::undefined())
 }
 
 /// The library's constructor, held by the host so that conversions keep working whatever the
@@ -135,35 +134,23 @@ fn bigint_constructor(ctx: &mut Context) -> JsResult<JsValue> {
     Ok(big_int)
 }
 
-/// Accepts an assignment to one of the globals before the library is installed. Without a
-/// setter `bigInt = x` would be dropped until something read the global and only take effect
-/// afterwards; geth's `bigInt` is an ordinary writable global throughout.
-fn bigint_lazy_setter(
-    _this: &JsValue,
-    args: &[JsValue],
-    name: &&'static str,
-    ctx: &mut Context,
-) -> JsResult<JsValue> {
-    // Only the assigned name is replaced; the sibling alias keeps its own binding.
-    if let Some(LazyBigIntGlobals(pending)) = ctx.remove_data::<LazyBigIntGlobals>().map(|p| *p) {
-        let pending = core::array::from_fn(|i| pending[i] && BIG_INT_GLOBALS[i] != *name);
-        ctx.insert_data(LazyBigIntGlobals(pending));
-    }
-    define_bigint_global(ctx, name, args.get_or_undefined(0).clone())?;
-    Ok(JsValue::undefined())
-}
-
 /// Installs go-ethereum's `bigInt` environment lazily: parsing the 26 KB library dwarfs
 /// building the [`Context`], and a fresh one is built per traced transaction. Triggering on
 /// property access cannot miss a reference such as `globalThis['big' + 'Int']`.
+///
+/// The globals stay accessors for good, with the values kept by the host. Redefining one from
+/// inside its own getter or setter would corrupt Boa's inline cache: the global lookup caches
+/// the slot it read through together with the object's shape *after* the call, so the next
+/// lookup from the same expression takes the new value for a getter and calls it.
 fn install_bigint(ctx: &mut Context) -> JsResult<()> {
-    ctx.insert_data(LazyBigIntGlobals([true; 2]));
-    let getter = NativeFunction::from_fn_ptr(bigint_lazy_getter).to_js_function(ctx.realm());
-    for name in BIG_INT_GLOBALS {
-        let setter = NativeFunction::from_copy_closure_with_captures(bigint_lazy_setter, name)
+    ctx.insert_data(BigIntGlobals::default());
+    for (index, name) in BIG_INT_GLOBALS.into_iter().enumerate() {
+        let getter = NativeFunction::from_copy_closure_with_captures(bigint_global_getter, index)
+            .to_js_function(ctx.realm());
+        let setter = NativeFunction::from_copy_closure_with_captures(bigint_global_setter, index)
             .to_js_function(ctx.realm());
         let desc = PropertyDescriptor::builder()
-            .get(getter.clone())
+            .get(getter)
             .set(setter)
             .enumerable(true)
             .configurable(true)
@@ -587,33 +574,21 @@ mod tests {
         let mut ctx = Context::default();
         register_builtins(&mut ctx).unwrap();
 
-        let descriptor_kind = |ctx: &mut Context| {
-            ctx.eval(Source::from_bytes(
-                b"typeof Object.getOwnPropertyDescriptor(globalThis, 'bigInt').get",
-            ))
-            .unwrap()
-            .to_string(ctx)
-            .unwrap()
-            .to_std_string()
-            .unwrap()
-        };
+        // Untouched: the library has not been evaluated.
+        assert!(ctx.get_data::<BigIntConstructor>().is_none());
 
-        // Untouched: still an accessor.
-        assert_eq!(descriptor_kind(&mut ctx), "function");
-
-        // Reading it installs the library and swaps in a plain data property.
+        // Reading it evaluates the library.
         let value = ctx.eval(Source::from_bytes(b"bigInt(7).toString()")).unwrap();
         assert_eq!(value.to_string(&mut ctx).unwrap().to_std_string().unwrap(), "7");
-        assert_eq!(descriptor_kind(&mut ctx), "undefined");
+        assert!(ctx.get_data::<BigIntConstructor>().is_some());
 
         // Both names must end up bound to the same constructor.
         let same = ctx.eval(Source::from_bytes(b"bigInt === bigint")).unwrap();
         assert!(same.as_boolean().unwrap());
     }
 
-    /// Assigning to `bigInt` must not depend on whether the library is installed yet: a
-    /// bare accessor would make it a no-op before the first read and an ordinary assignment
-    /// after. geth's `bigInt` is a plain writable global throughout.
+    /// Assigning to `bigInt` must not depend on whether the library is installed yet. geth's
+    /// `bigInt` is a plain writable global throughout.
     #[test]
     fn test_bigint_global_is_assignable_before_and_after_install() {
         // Before: assignment goes through the setter.
@@ -622,7 +597,7 @@ mod tests {
         let before = ctx.eval(Source::from_bytes(b"bigInt = 1; typeof bigInt")).unwrap();
         assert_eq!(before.to_string(&mut ctx).unwrap().to_std_string().unwrap(), "number");
         // The sibling alias is independent, as two ordinary globals would be: reading it
-        // installs the library for it alone and leaves the assigned one alone.
+        // yields the library for it alone and leaves the assigned one alone.
         let alias = ctx.eval(Source::from_bytes(b"typeof bigint + ' ' + typeof bigInt")).unwrap();
         assert_eq!(alias.to_string(&mut ctx).unwrap().to_std_string().unwrap(), "function number");
         // Nor does a conversion the host makes, such as `stack.peek()`'s, disturb it.
@@ -631,7 +606,7 @@ mod tests {
         let kept = ctx.eval(Source::from_bytes(b"bigInt")).unwrap();
         assert_eq!(kept, JsValue::from(1));
 
-        // After: the property is a data property and assignment still works.
+        // After: assignment still works.
         let mut ctx = Context::default();
         register_builtins(&mut ctx).unwrap();
         let after = ctx

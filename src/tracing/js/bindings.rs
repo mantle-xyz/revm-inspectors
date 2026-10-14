@@ -21,7 +21,7 @@ use boa_engine::{
     property::PropertyDescriptor,
     Context, JsArgs, JsError, JsNativeError, JsObject, JsResult, JsString, JsValue,
 };
-use boa_gc::{empty_trace, Finalize, Trace};
+use boa_gc::{empty_trace, Finalize, Gc, GcRefCell, Trace};
 use core::cell::RefCell;
 use revm::{
     bytecode::opcode::{self, OpCode, PUSH0, PUSH32},
@@ -806,39 +806,40 @@ impl CallFrame {
 }
 
 /// Defines `name` on `obj` as a big integer materialised on first read, since converting
-/// eagerly would evaluate the whole `bigInt` library per `result()` call. A read or an assignment
-/// turns the accessor into a writable data property, like the plain property go-ethereum exposes,
-/// so assigning before ever reading keeps the assigned value.
+/// eagerly would evaluate the whole `bigInt` library per `result()` call. The accessor stores
+/// what it materialises and what the script assigns, so it reads like the plain property
+/// go-ethereum exposes: the same object on every read, and an assignment sticks, also one made
+/// before any read.
+///
+/// It must stay an accessor: redefining the property from inside its own getter or setter
+/// corrupts Boa's inline cache, which pairs the slot it went through with the object's shape
+/// *after* the call, so the next access from the same expression misreads the property.
 fn define_lazy_bigint(
     obj: &JsObject,
     name: &'static str,
     value: U256,
     ctx: &mut Context,
 ) -> JsResult<()> {
-    let getter = NativeFunction::from_copy_closure(move |this, _args, ctx| {
-        let big_int = to_bigint(value, ctx)?;
-        // A frozen object can no longer be redefined; it then just keeps answering through
-        // the accessor, as a frozen data property would keep its value.
-        if let Some(this) = this.as_object() {
-            let _ = this.define_property_or_throw(
-                JsString::from(name),
-                plain_property(big_int.clone()),
-                ctx,
-            );
-        }
-        Ok(big_int)
-    })
+    let cell = Gc::new(GcRefCell::new(None::<JsValue>));
+    let getter = NativeFunction::from_copy_closure_with_captures(
+        move |_this, _args, cell: &Gc<GcRefCell<Option<JsValue>>>, ctx| {
+            if let Some(current) = cell.borrow().clone() {
+                return Ok(current);
+            }
+            let big_int = to_bigint(value, ctx)?;
+            *cell.borrow_mut() = Some(big_int.clone());
+            Ok(big_int)
+        },
+        cell.clone(),
+    )
     .to_js_function(ctx.realm());
-    let setter = NativeFunction::from_copy_closure(move |this, args, ctx| {
-        if let Some(this) = this.as_object() {
-            this.define_property_or_throw(
-                JsString::from(name),
-                plain_property(args.get_or_undefined(0).clone()),
-                ctx,
-            )?;
-        }
-        Ok(JsValue::undefined())
-    })
+    let setter = NativeFunction::from_copy_closure_with_captures(
+        |_this, args, cell: &Gc<GcRefCell<Option<JsValue>>>, _ctx| {
+            *cell.borrow_mut() = Some(args.get_or_undefined(0).clone());
+            Ok(JsValue::undefined())
+        },
+        cell,
+    )
     .to_js_function(ctx.realm());
 
     obj.define_property_or_throw(
@@ -852,17 +853,6 @@ fn define_lazy_bigint(
         ctx,
     )?;
     Ok(())
-}
-
-/// A writable, enumerable, configurable data property holding `value`: what a plain
-/// assignment creates.
-fn plain_property(value: JsValue) -> PropertyDescriptor {
-    PropertyDescriptor::builder()
-        .value(value)
-        .writable(true)
-        .enumerable(true)
-        .configurable(true)
-        .build()
 }
 
 /// The `ctx` object that represents the context in which the transaction is executed.
