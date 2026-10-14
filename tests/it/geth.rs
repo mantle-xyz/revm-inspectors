@@ -1,6 +1,6 @@
 //! Geth tests
 use crate::utils::deploy_contract;
-use alloy_primitives::{address, hex, map::HashMap, Address, Bytes, TxKind, B256};
+use alloy_primitives::{address, hex, map::HashMap, Address, Bytes, TxKind, B256, U256};
 use alloy_rpc_types_eth::TransactionInfo;
 use alloy_rpc_types_trace::geth::{
     erc7562::Erc7562Config, mux::MuxConfig, CallConfig, FlatCallConfig, GethDebugBuiltInTracerType,
@@ -1182,4 +1182,158 @@ fn test_geth_calltracer_logs_delegatecall() {
         Some(implementation),
         "Log emitter must NOT be the implementation (bytecode) address"
     );
+}
+
+/// A tracer wrapped in `muxTracer` must describe the root frame exactly as it does on its own.
+///
+/// `gas` and `from` on the root frame are transaction-level values that every other
+/// `DebugInspector` branch installs before building its frame; the mux branch used to skip it,
+/// so the same `callTracer` reported the EVM's inner gas once wrapped.
+#[test]
+fn test_geth_mux_call_tracer_matches_standalone() {
+    let account = address!("1000000000000000000000000000000000000001");
+    let caller = address!("1000000000000000000000000000000000000002");
+    let gas_limit = 1_000_000;
+
+    fn root_call_frame(
+        opts: GethDebugTracingOptions,
+        account: Address,
+        caller: Address,
+        gas_limit: u64,
+    ) -> GethTrace {
+        let context =
+            Context::mainnet().with_db(CacheDB::<EmptyDB>::default()).modify_db_chained(|db| {
+                db.insert_account_info(
+                    account,
+                    AccountInfo {
+                        // PUSH1 1, PUSH1 0, MSTORE, STOP
+                        code: Some(Bytecode::new_raw(hex!("600160005200").into())),
+                        ..Default::default()
+                    },
+                );
+            });
+
+        let mut inspector = DebugInspector::new(opts).unwrap();
+        let mut evm = context.build_mainnet().with_inspector(&mut inspector);
+        let res = evm
+            .inspect_tx(TxEnv {
+                caller,
+                gas_limit,
+                kind: TransactTo::Call(account),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(res.result.is_success(), "{res:#?}");
+
+        let (ctx, inspector) = evm.ctx_inspector();
+        let tx_env = ctx.tx().clone();
+        let block_env = ctx.block().clone();
+        inspector.get_result(None, &tx_env, &block_env, &res, ctx.db_mut()).unwrap()
+    }
+
+    let call_config = CallConfig { only_top_call: Some(true), with_log: Some(false) };
+
+    let standalone = match root_call_frame(
+        GethDebugTracingOptions::call_tracer(call_config),
+        account,
+        caller,
+        gas_limit,
+    ) {
+        GethTrace::CallTracer(frame) => frame,
+        other => panic!("expected CallTracer, got {other:?}"),
+    };
+
+    let mux_config = MuxConfig(HashMap::from_iter([(
+        GethDebugTracerType::BuiltInTracer(GethDebugBuiltInTracerType::CallTracer),
+        Some(GethDebugTracerConfig(serde_json::to_value(call_config).unwrap())),
+    )]));
+    let muxed = match root_call_frame(
+        GethDebugTracingOptions::mux_tracer(mux_config),
+        account,
+        caller,
+        gas_limit,
+    ) {
+        GethTrace::MuxTracer(frame) => match frame.0
+            [&GethDebugTracerType::BuiltInTracer(GethDebugBuiltInTracerType::CallTracer)]
+            .clone()
+        {
+            GethTrace::CallTracer(frame) => frame,
+            other => panic!("expected CallTracer inside the mux frame, got {other:?}"),
+        },
+        other => panic!("expected MuxTracer, got {other:?}"),
+    };
+
+    // The transaction's gas limit, not what the EVM had left after the intrinsic cost.
+    assert_eq!(standalone.gas, gas_limit);
+    assert_eq!(muxed.gas, standalone.gas);
+    assert_eq!(muxed.from, standalone.from);
+    assert_eq!(muxed.gas_used, standalone.gas_used);
+}
+
+/// `flatCallTracer` must report the same root `gasUsed` as `callTracer`: the transaction's gas
+/// used, intrinsic cost included, whether it runs on its own or inside `muxTracer`.
+#[test]
+fn test_geth_flat_call_tracer_root_gas_used_matches_call_tracer() {
+    let account = address!("1000000000000000000000000000000000000001");
+    let caller = address!("1000000000000000000000000000000000000002");
+
+    fn trace(opts: GethDebugTracingOptions, account: Address, caller: Address) -> (GethTrace, u64) {
+        let context =
+            Context::mainnet().with_db(CacheDB::<EmptyDB>::default()).modify_db_chained(|db| {
+                db.insert_account_info(
+                    account,
+                    AccountInfo {
+                        // PUSH1 1, PUSH1 0, MSTORE, STOP
+                        code: Some(Bytecode::new_raw(hex!("600160005200").into())),
+                        ..Default::default()
+                    },
+                );
+            });
+
+        let mut inspector = DebugInspector::new(opts).unwrap();
+        let mut evm = context.build_mainnet().with_inspector(&mut inspector);
+        let res = evm
+            .inspect_tx(TxEnv {
+                caller,
+                gas_limit: 1_000_000,
+                kind: TransactTo::Call(account),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(res.result.is_success(), "{res:#?}");
+
+        let (ctx, inspector) = evm.ctx_inspector();
+        let tx_env = ctx.tx().clone();
+        let block_env = ctx.block().clone();
+        let trace = inspector.get_result(None, &tx_env, &block_env, &res, ctx.db_mut()).unwrap();
+        (trace, res.result.tx_gas_used())
+    }
+
+    fn flat_root_gas_used(trace: GethTrace) -> u64 {
+        match trace {
+            GethTrace::FlatCallTracer(traces) => {
+                traces[0].trace.result.as_ref().expect("root call has a result").gas_used()
+            }
+            other => panic!("expected FlatCallTracer, got {other:?}"),
+        }
+    }
+
+    let flat_type = GethDebugTracerType::BuiltInTracer(GethDebugBuiltInTracerType::FlatCallTracer);
+
+    let (call, tx_gas_used) =
+        trace(GethDebugTracingOptions::call_tracer(CallConfig::default()), account, caller);
+    let GethTrace::CallTracer(call) = call else { panic!("expected CallTracer, got {call:?}") };
+    assert_eq!(call.gas_used, U256::from(tx_gas_used));
+
+    let (flat, _) =
+        trace(GethDebugTracingOptions::default().with_tracer(flat_type.clone()), account, caller);
+    assert_eq!(flat_root_gas_used(flat), tx_gas_used);
+
+    let mux_config = MuxConfig(HashMap::from_iter([(
+        flat_type.clone(),
+        Some(GethDebugTracerConfig(serde_json::to_value(FlatCallConfig::default()).unwrap())),
+    )]));
+    let (muxed, _) = trace(GethDebugTracingOptions::mux_tracer(mux_config), account, caller);
+    let GethTrace::MuxTracer(mut frame) = muxed else { panic!("expected MuxTracer") };
+    assert_eq!(flat_root_gas_used(frame.0.remove(&flat_type).unwrap()), tx_gas_used);
 }
