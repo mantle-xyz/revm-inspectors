@@ -10,7 +10,7 @@ use alloy_rpc_types_trace::geth::{
 use revm::{
     bytecode::{opcode, Bytecode},
     context::TxEnv,
-    context_interface::{ContextTr, TransactTo},
+    context_interface::{result::ResultGas, ContextTr, TransactTo},
     database::CacheDB,
     database_interface::EmptyDB,
     handler::EvmTr,
@@ -1506,5 +1506,59 @@ fn test_geth_opcode_limit_end_to_end() {
         let calls = run(json!({ "tracer": "callTracer" })).0;
         assert_eq!(calls["calls"].as_array().unwrap().len(), 1);
         assert_eq!(run(json!({ "tracer": "callTracer", "limit": 2 })).0, calls);
+    }
+}
+
+fn trace_contract(
+    spec: SpecId,
+    opts: GethDebugTracingOptions,
+    code: Bytes,
+) -> (GethTrace, ResultGas) {
+    let contract = address!("1000000000000000000000000000000000000001");
+    let caller = address!("1000000000000000000000000000000000000002");
+    let context = Context::mainnet()
+        .with_db(CacheDB::<EmptyDB>::default())
+        .modify_cfg_chained(|cfg| cfg.set_spec_and_mainnet_gas_params(spec))
+        .modify_db_chained(|db| {
+            db.insert_account_info(
+                contract,
+                AccountInfo { code: Some(Bytecode::new_raw(code)), ..Default::default() },
+            );
+        });
+    let mut inspector = DebugInspector::new(opts).unwrap();
+    let mut evm = context.build_mainnet().with_inspector(&mut inspector);
+
+    let res = evm
+        .inspect_tx(TxEnv {
+            caller,
+            gas_limit: 1_000_000,
+            gas_price: 0,
+            kind: TransactTo::Call(contract),
+            data: Bytes::default(),
+            nonce: 0,
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(res.result.is_success(), "{res:#?}");
+
+    let (ctx, inspector) = evm.ctx_inspector();
+    let tx_env = ctx.tx().clone();
+    let block_env = ctx.block().clone();
+    let trace = inspector.get_result(None, &tx_env, &block_env, &res, ctx.db_mut()).unwrap();
+    (trace, *res.result.gas())
+}
+
+#[test]
+fn test_geth_4byte_tracer_skips_precompiles() {
+    // STATICCALL the sha256 precompile with 36 bytes, then an empty account with 4 bytes.
+    let code = hex!("600060006024600060025afa50600060006004600061dead5afa5000").into();
+    let opts = serde_json::from_value(serde_json::json!({ "tracer": "4byteTracer" })).unwrap();
+    let (trace, _) = trace_contract(SpecId::PRAGUE, opts, code);
+
+    match trace {
+        GethTrace::FourByteTracer(frame) => {
+            assert_eq!(frame.0, std::collections::BTreeMap::from([("0x00000000-0".into(), 1)]));
+        }
+        _ => panic!("Expected FourByteTracer"),
     }
 }
