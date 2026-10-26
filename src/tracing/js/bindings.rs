@@ -455,14 +455,13 @@ impl StateRef {
         (Self { state: inner, finalised }, guard)
     }
 
-    fn get_account(&self, address: &Address) -> Option<AccountInfo> {
+    /// The account as the transaction has left it so far: `Some(None)` once the transaction is
+    /// over and it self-destructed, so the account no longer exists, or `None` if the
+    /// transaction has not touched it and the database holds the answer.
+    fn get_account(&self, address: &Address) -> Option<Option<AccountInfo>> {
         self.state.with_inner(|state| {
             let acc = state.get(address)?;
-            Some(if self.finalised && acc.is_selfdestructed() {
-                AccountInfo::default()
-            } else {
-                acc.info.clone()
-            })
+            Some((!(self.finalised && acc.is_selfdestructed())).then(|| acc.info.clone()))
         })?
     }
 
@@ -1047,7 +1046,9 @@ impl EvmDbRef {
         if let Some((_, acc)) = self.inner.pre_state.accounts.iter().find(|(a, _)| *a == address) {
             return Ok(acc.clone());
         }
-        if let acc @ Some(_) = self.inner.state.get_account(&address) {
+        // A destroyed account is gone, not merely unknown: the database must not answer for it,
+        // since before EIP-6780 it may still hold the account as it was before the transaction.
+        if let Some(acc) = self.inner.state.get_account(&address) {
             return Ok(acc);
         }
 

@@ -31,8 +31,8 @@ use revm::{
     inspector::JournalExt,
     interpreter::{
         interpreter_types::{Jumps, LoopControl},
-        CallInputs, CallOutcome, CallScheme, CreateInputs, CreateOutcome, FrameInput, Gas,
-        InstructionResult, Interpreter, InterpreterAction, InterpreterResult, STACK_LIMIT,
+        CallInputs, CallOutcome, CallScheme, CreateInputs, CreateOutcome, FrameInput,
+        InstructionResult, Interpreter, InterpreterAction, STACK_LIMIT,
     },
     DatabaseRef, Inspector,
 };
@@ -283,8 +283,7 @@ impl JsInspector {
     /// `step` hook, since the EVM can otherwise run on long after the script has stopped.
     ///
     /// This is independent of which error the trace reports: a hook that has already thrown
-    /// keeps its error as the result, but the EVM still stops at the deadline. A throw at a
-    /// `CALL` or `CREATE` cannot halt its own frame, which is already handing over to the child.
+    /// keeps its error as the result but leaves the EVM running, so the deadline still stops it.
     fn timed_out(&mut self) -> bool {
         let Some(deadline) = self.deadline else {
             return false;
@@ -694,16 +693,9 @@ where
                     pending.into_step_log(cost, error, &post_memory);
                 self.try_step(step, db)
             };
+            // A throwing hook fails the trace, not the traced execution, which runs on unchanged.
             if let Err(err) = called {
                 self.record_hook_error("step", err);
-                // Only if the instruction did not already end the frame: setting a second
-                // action panics, and a frame that is ending anyway needs no halt.
-                if interp.bytecode.action().is_none() {
-                    interp.bytecode.set_action(InterpreterAction::new_halt(
-                        InstructionResult::Revert,
-                        interp.gas,
-                    ));
-                }
                 return;
             }
         }
@@ -783,11 +775,7 @@ where
                 gas: inputs.gas_limit,
             };
             if let Err(err) = self.try_enter(frame) {
-                self.record_hook_error("enter", err.clone());
-                return Some(CallOutcome::new(
-                    js_error_to_revert(err),
-                    inputs.return_memory_offset.clone(),
-                ));
+                self.record_hook_error("enter", err);
             }
         }
 
@@ -805,8 +793,7 @@ where
                 error: utils::fmt_error_msg(outcome.result.result, TraceStyle::Geth),
             };
             if let Err(err) = self.try_exit(frame_result) {
-                self.record_hook_error("exit", err.clone());
-                outcome.result = js_error_to_revert(err);
+                self.record_hook_error("exit", err);
             }
         }
 
@@ -835,8 +822,7 @@ where
                 gas: call.gas_limit,
             };
             if let Err(err) = self.try_enter(frame) {
-                self.record_hook_error("enter", err.clone());
-                return Some(CreateOutcome::new(js_error_to_revert(err), None));
+                self.record_hook_error("enter", err);
             }
         }
 
@@ -861,8 +847,7 @@ where
                 error: utils::fmt_error_msg(outcome.result.result, TraceStyle::Geth),
             };
             if let Err(err) = self.try_exit(frame_result) {
-                self.record_hook_error("exit", err.clone());
-                outcome.result = js_error_to_revert(err);
+                self.record_hook_error("exit", err);
             }
         }
 
@@ -1121,13 +1106,6 @@ fn refunded_gas(interp: &Interpreter, enclosing: i64) -> u64 {
     (enclosing + interp.gas.refunded()).max(0) as u64
 }
 
-/// Converts a JavaScript error into a [InstructionResult::Revert] [InterpreterResult].
-#[inline]
-fn js_error_to_revert(err: JsError) -> InterpreterResult {
-    let output = err.to_string().as_bytes().to_vec();
-    InterpreterResult { result: InstructionResult::Revert, output: output.into(), gas: Gas::new(0) }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1235,6 +1213,70 @@ mod tests {
         }
         let (ctx, inspector) = evm.ctx_inspector();
         inspector.json_result(res, ctx.tx(), ctx.block(), ctx.db_ref())
+    }
+
+    /// A throwing hook fails the trace but leaves the traced execution alone: the transaction
+    /// succeeds, spends the same gas and writes the same state as under a tracer that does not
+    /// throw. Halting it instead would hand block tracing the wrong state for the next
+    /// transaction, and the trace is an error either way.
+    #[test]
+    fn test_hook_failure_leaves_execution_unchanged() {
+        let callee = Address::repeat_byte(0x02);
+        // 0x01: CALL(gas, 0x02, 0, 0, 0, 0, 0), STOP. 0x02: SSTORE(0, 1), STOP.
+        let caller = Bytes::from(
+            [&hex!("6000600060006000600073")[..], callee.as_slice(), &hex!("5af100")[..]].concat(),
+        );
+        let run = |code: &str| {
+            let mut db = CacheDB::new(EmptyDB::default());
+            db.insert_account_info(
+                Address::ZERO,
+                AccountInfo { balance: U256::from(1e18), ..Default::default() },
+            );
+            db.insert_account_info(
+                Address::repeat_byte(0x01),
+                AccountInfo {
+                    code: Some(Bytecode::new_legacy(caller.clone())),
+                    ..Default::default()
+                },
+            );
+            db.insert_account_info(
+                callee,
+                AccountInfo {
+                    code: Some(Bytecode::new_legacy(bytes!("600160005500"))),
+                    ..Default::default()
+                },
+            );
+            let insp = JsInspector::new(code.to_string(), serde_json::Value::Null).unwrap();
+            let mut evm = revm::Context::mainnet()
+                .modify_cfg_chained(|cfg| cfg.spec = SpecId::CANCUN)
+                .with_db(db)
+                .build_mainnet_with_inspector(insp);
+            let res = evm
+                .inspect_tx(TxEnv {
+                    gas_limit: 1_000_000,
+                    kind: TransactTo::Call(Address::repeat_byte(0x01)),
+                    ..Default::default()
+                })
+                .unwrap();
+            let slot = res
+                .state
+                .get(&callee)
+                .and_then(|acc| acc.storage.get(&U256::ZERO))
+                .map(|s| s.present_value());
+            (res.result.is_success(), res.result.tx_gas_used(), slot)
+        };
+
+        let quiet = run("{step:function(){},fault:function(){},result:function(){return 1}}");
+        assert_eq!(quiet, (true, quiet.1, Some(U256::from(1))));
+        for code in [
+            "{step:function(){throw new Error('boom')},fault:function(){},result:function(){return 1}}",
+            "{step:function(){},fault:function(){},enter:function(){throw new Error('boom')},\
+             exit:function(){},result:function(){return 1}}",
+            "{step:function(){},fault:function(){},enter:function(){},\
+             exit:function(){throw new Error('boom')},result:function(){return 1}}",
+        ] {
+            assert_eq!(run(code), quiet, "{code}");
+        }
     }
 
     /// Asserts that a throwing `step` hook fails the whole trace, naming the hook. geth does
@@ -2639,8 +2681,8 @@ mod tests {
         }
     }
 
-    /// A hook that threw at a `CALL` cannot halt its frame, which is already starting the child;
-    /// the deadline must still stop the child, while the trace reports the hook's error.
+    /// A hook that threw leaves the EVM running; the deadline must still stop it, here in a child
+    /// that loops forever, while the trace reports the hook's error.
     #[test]
     fn test_timeout_stops_the_evm_after_a_hook_error() {
         // The root calls itself with all its gas; the child (CALLER == ADDRESS) loops forever.
@@ -2812,7 +2854,8 @@ mod tests {
             },
             fault: function() {},
             result: function(ctx, db) {
-                this.seen.push(toHex(db.getState(ctx.to, toWord("0x00"))), db.getNonce(ctx.to));
+                this.seen.push(toHex(db.getState(ctx.to, toWord("0x00"))), db.getNonce(ctx.to),
+                    db.exists(ctx.to));
                 return this.seen;
             }}"#;
         let insp = JsInspector::new(code.to_string(), serde_json::Value::Null).unwrap();
@@ -2832,7 +2875,7 @@ mod tests {
         assert!(res.result.is_success());
         let (ctx, inspector) = evm.ctx_inspector();
         let res = inspector.json_result(res, ctx.tx(), ctx.block(), ctx.db_ref()).unwrap();
-        assert_eq!(res, json!([format!("0x{:064x}", 0x2a), format!("0x{:064x}", 0), 0]));
+        assert_eq!(res, json!([format!("0x{:064x}", 0x2a), format!("0x{:064x}", 0), 0, false]));
     }
 
     /// The `db` a step sees is the state before the instruction, as with geth's `OnOpcode`,
