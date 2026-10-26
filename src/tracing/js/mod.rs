@@ -1076,8 +1076,13 @@ const fn is_fault(result: InstructionResult) -> bool {
         | InvalidOperandOOG | ReentrancySentryOOG => false,
         // geth checks the CREATE initcode size in the instruction's dynamic gas function.
         CreateInitCodeSizeLimit => false,
+        // A state write inside a static call is refused before the instruction does anything,
+        // whichever instruction it is. geth checks some in their gas functions and others while
+        // executing, sending CREATE, CREATE2, LOG and TSTORE to `fault`; that split follows where
+        // its checks happen to sit, not anything a tracer can tell apart.
+        StateChangeDuringStaticCall | CallNotAllowedInsideStatic => false,
         // Everything else is raised while executing the instruction: REVERT, invalid jump,
-        // undefined opcode, write protection, return-data overrun, and the create failures.
+        // undefined opcode, return-data overrun, and the create failures.
         _ => true,
     }
 }
@@ -2982,6 +2987,69 @@ mod tests {
         let res = run_trace(code, Some(bytes!("61c00160006000f000")), false);
         let err = "out of gas: max initcode size exceeded";
         assert_eq!(res, json!([[err], 0, err]));
+    }
+
+    /// An instruction that writes state inside a static call is rejected before it runs, so
+    /// `step` gets the error and `fault` does not fire, whichever instruction it is: the same
+    /// as for any other instruction rejected before it runs. geth splits these by where it
+    /// happens to check, sending CREATE, CREATE2, LOG and TSTORE to `fault` instead.
+    #[test]
+    fn test_step_reports_write_protection_in_a_static_call() {
+        let code = r#"{errors: [], faults: 0,
+            step: function(log) { var e = log.getError(); if (e) this.errors.push(log.op.toString() + ": " + e) },
+            fault: function() { this.faults++ },
+            result: function() { return [this.errors, this.faults] }}"#;
+        let inner = Address::repeat_byte(0x02);
+        let beneficiary = Address::repeat_byte(0x03);
+        // 0x01: STATICCALL(gas, 0x02, 0, 0, 0, 0), STOP.
+        let outer =
+            [&hex!("600060006000600073")[..], inner.as_slice(), &hex!("5afa00")[..]].concat();
+        let cases: [(&str, Vec<u8>); 7] = [
+            ("SSTORE", hex!("600160005500").to_vec()),
+            ("SELFDESTRUCT", [&[0x73][..], beneficiary.as_slice(), &[0xff]].concat()),
+            (
+                "CALL",
+                [&hex!("6000600060006000600173")[..], beneficiary.as_slice(), &hex!("5af100")[..]]
+                    .concat(),
+            ),
+            ("CREATE", hex!("600060006000f000").to_vec()),
+            ("CREATE2", hex!("6000600060006000f500").to_vec()),
+            ("LOG0", hex!("60006000a000").to_vec()),
+            ("TSTORE", hex!("600160005d00").to_vec()),
+        ];
+        for (op, bytecode) in cases {
+            let mut db = CacheDB::new(EmptyDB::default());
+            db.insert_account_info(
+                Address::ZERO,
+                AccountInfo { balance: U256::from(1e18), ..Default::default() },
+            );
+            for (address, code) in [(Address::repeat_byte(0x01), outer.clone()), (inner, bytecode)]
+            {
+                db.insert_account_info(
+                    address,
+                    AccountInfo {
+                        balance: U256::from(10),
+                        code: Some(Bytecode::new_legacy(code.into())),
+                        ..Default::default()
+                    },
+                );
+            }
+            let insp = JsInspector::new(code.to_string(), serde_json::Value::Null).unwrap();
+            let mut evm = revm::Context::mainnet()
+                .modify_cfg_chained(|cfg| cfg.spec = SpecId::CANCUN)
+                .with_db(db)
+                .build_mainnet_with_inspector(insp);
+            let res = evm
+                .inspect_tx(TxEnv {
+                    gas_limit: 1_000_000,
+                    kind: TransactTo::Call(Address::repeat_byte(0x01)),
+                    ..Default::default()
+                })
+                .unwrap();
+            let (ctx, inspector) = evm.ctx_inspector();
+            let res = inspector.json_result(res, ctx.tx(), ctx.block(), ctx.db_ref()).unwrap();
+            assert_eq!(res, json!([[format!("{op}: write protection")], 0]), "{op}");
+        }
     }
 
     /// Plain function recursion within the limit succeeds.
