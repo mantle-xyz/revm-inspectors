@@ -26,14 +26,17 @@ use revm::{
     context::JournalTr,
     context_interface::{
         result::{ExecutionResult, HaltReasonTr, Output, ResultAndState},
-        Block, ContextTr, TransactTo, Transaction,
+        Block, Cfg, ContextTr, DummyHost, TransactTo, Transaction,
     },
     inspector::JournalExt,
     interpreter::{
+        instructions::instruction_table_gas_changes_spec,
+        interpreter::EthInterpreter,
         interpreter_types::{Jumps, LoopControl},
         CallInputs, CallOutcome, CallScheme, CreateInputs, CreateOutcome, FrameInput,
         InstructionResult, Interpreter, InterpreterAction, STACK_LIMIT,
     },
+    primitives::hardfork::SpecId,
     DatabaseRef, Inspector,
 };
 use std::time::{Duration, Instant};
@@ -668,6 +671,14 @@ where
             {
                 cost = cost.saturating_sub(inputs.gas_limit());
             }
+            // An instruction that cannot pay its static gas takes all the gas left, which says
+            // nothing `log.getGas()` does not; its static gas says why it failed.
+            if halt == Some(InstructionResult::OutOfGas) {
+                let static_gas = static_gas(pending.op, context.cfg().spec().into());
+                if pending.gas_remaining < static_gas {
+                    cost = static_gas;
+                }
+            }
             // Like the cost, the refund is read after the instruction: geth meters an SSTORE's
             // refund with its dynamic gas, before `OnOpcode`, so the step includes it.
             pending.refund = refunded_gas(interp, self.enclosing_refund());
@@ -1085,6 +1096,13 @@ const fn is_fault(result: InstructionResult) -> bool {
         // undefined opcode, return-data overrun, and the create failures.
         _ => true,
     }
+}
+
+/// The gas `op` is charged before anything else it costs under `spec`.
+///
+/// For opcodes priced by warm or cold access, such as SLOAD and CALL, this is the warm cost.
+fn static_gas(op: u8, spec: SpecId) -> u64 {
+    instruction_table_gas_changes_spec::<EthInterpreter, DummyHost>(spec)[op as usize].static_gas()
 }
 
 /// The message geth gives `step` for an instruction it rejects while metering, before it runs.
@@ -2972,6 +2990,20 @@ mod tests {
         // PUSH1 with only 2 gas left after the intrinsic cost.
         let res = run_trace_with_gas(code, Some(bytes!("6001")), false, 21_002);
         assert_eq!(res, json!([["out of gas"], 0]));
+    }
+
+    /// An instruction that cannot pay its static gas reports that gas as its cost, which with the
+    /// gas left says why it failed. The gas actually deducted is everything that was left, the
+    /// same as `log.getGas()`.
+    #[test]
+    fn test_cost_of_an_instruction_short_of_its_static_gas() {
+        let code = r#"{costs: [],
+            step: function(log) { this.costs.push([log.op.toString(), log.getGas(), log.getCost()]) },
+            fault: function() {},
+            result: function() { return this.costs }}"#;
+        // PUSH1 with only 2 gas left after the intrinsic cost.
+        let res = run_trace_with_gas(code, Some(bytes!("6001")), false, 21_002);
+        assert_eq!(res, json!([["PUSH1", 2, 3]]));
     }
 
     /// An oversized CREATE initcode is rejected while metering: geth checks the size in the
