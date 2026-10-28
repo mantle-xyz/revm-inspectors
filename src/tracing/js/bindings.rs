@@ -5,7 +5,6 @@ use crate::tracing::{
         address_to_uint8_array, address_to_uint8_array_value, bytes_from_value, bytes_to_address,
         bytes_to_b256, to_bigint, to_uint8_array, to_uint8_array_value,
     },
-    types::CallKind,
     TransactionContext,
 };
 use alloc::{
@@ -20,14 +19,14 @@ use boa_engine::{
     js_string,
     native_function::NativeFunction,
     object::{builtins::JsUint8Array, FunctionObjectBuilder},
-    Context, JsArgs, JsError, JsNativeError, JsObject, JsResult, JsValue,
+    property::PropertyDescriptor,
+    Context, JsArgs, JsError, JsNativeError, JsObject, JsResult, JsString, JsValue,
 };
-use boa_gc::{empty_trace, Finalize, Trace};
+use boa_gc::{empty_trace, Finalize, Gc, GcRefCell, Trace};
 use core::cell::RefCell;
 use revm::{
-    bytecode::opcode::{OpCode, PUSH0, PUSH32},
+    bytecode::opcode::{self, OpCode, PUSH0, PUSH32},
     context_interface::DBErrorMarker,
-    interpreter::{SharedMemory, Stack},
     primitives::KECCAK_EMPTY,
     state::{AccountInfo, Bytecode, EvmState},
     Database, DatabaseRef,
@@ -204,7 +203,7 @@ impl ReusableCallFrame {
         let get_value = FunctionObjectBuilder::new(
             ctx.realm(),
             NativeFunction::from_copy_closure_with_captures(
-                move |_this, _args, state, _ctx| to_bigint(state.0.borrow().value),
+                move |_this, _args, state, ctx| to_bigint(state.0.borrow().value, ctx),
                 state.clone(),
             ),
         )
@@ -234,7 +233,7 @@ impl ReusableCallFrame {
             ctx.realm(),
             NativeFunction::from_copy_closure_with_captures(
                 move |_this, _args, state, _ctx| {
-                    Ok(JsValue::from(js_string!(state.0.borrow().kind.as_str())))
+                    Ok(JsValue::from(js_string!(state.0.borrow().kind)))
                 },
                 state.clone(),
             ),
@@ -361,7 +360,7 @@ impl ReusableEvmDb {
                         .read_basic(args.get_or_undefined(0).clone(), ctx)?
                         .map(|acc| acc.balance)
                         .unwrap_or_default();
-                    to_bigint(balance)
+                    to_bigint(balance, ctx)
                 },
                 state.clone(),
             ),
@@ -484,7 +483,7 @@ struct CallFrameState {
     value: U256,
     input: Bytes,
     gas: u64,
-    kind: String,
+    kind: &'static str,
 }
 
 impl From<CallFrame> for CallFrameState {
@@ -495,7 +494,7 @@ impl From<CallFrame> for CallFrameState {
             value: frame.contract.value,
             input: frame.contract.input,
             gas: frame.gas,
-            kind: frame.kind.to_string(),
+            kind: frame.kind,
         }
     }
 }
@@ -543,7 +542,8 @@ fn build_step_op_object(state: Shared<StepLogState>, context: &mut Context) -> J
                 if let Some(op) = OpCode::new(value) {
                     Ok(JsValue::from(js_string!(op.as_str())))
                 } else {
-                    Ok(JsValue::from(js_string!(format!("opcode {:x} not defined", value))))
+                    // <https://github.com/ethereum/go-ethereum/blob/7c107c2691fa66a1da60e2b95f5946c3a3921b00/core/vm/opcodes.go#L461-L461>
+                    Ok(JsValue::from(js_string!(format!("opcode {:#x} not defined", value))))
                 }
             },
             state.clone(),
@@ -572,7 +572,7 @@ fn build_step_stack_object(
                     .borrow()
                     .stack
                     .as_ref()
-                    .and_then(|stack| stack.0.with_inner(Stack::len))
+                    .and_then(|stack| stack.0.with_inner(Vec::len))
                     .unwrap_or_default();
                 Ok(JsValue::from(len))
             },
@@ -591,14 +591,14 @@ fn build_step_stack_object(
                             .with_message("tracer accessed stack before it was initialized"),
                     )
                 })?;
-                let len = stack.0.with_inner(Stack::len).unwrap_or_default();
+                let len = stack.0.with_inner(Vec::len).unwrap_or_default();
                 let idx = StackRef::parse_index(args.get_or_undefined(0), len, ctx)?;
                 if len <= idx {
                     return Err(JsError::from_native(JsNativeError::typ().with_message(format!(
                         "tracer accessed out of bound stack: size {len}, index {idx}"
                     ))));
                 }
-                stack.peek(idx)
+                stack.peek(idx, ctx)
             },
             state.clone(),
         ),
@@ -638,20 +638,28 @@ fn build_step_memory_object(
                             .with_message("tracer accessed memory before it was initialized"),
                     )
                 })?;
-                let len = memory.len();
-                let start = MemoryRef::parse_index(args.get_or_undefined(0), "start", len, ctx)?;
-                let end = MemoryRef::parse_index(args.get_or_undefined(1), "end", len, ctx)?;
-                if end < start || end > len {
-                    return Err(MemoryRef::out_of_bounds_error(
-                        len,
-                        start,
-                        end.saturating_sub(start),
-                    ));
+                let (start, end) = (args.get_or_undefined(0), args.get_or_undefined(1));
+                // geth answers an empty range before rejecting negatives, so `slice(-1, -1)`
+                // yields an empty array rather than an error.
+                if let (Some(start), Some(end)) = (start.as_number(), end.as_number()) {
+                    if start == end {
+                        return to_uint8_array_value(Vec::new(), ctx);
+                    }
                 }
+                let start = MemoryRef::parse_index(start, "start", ctx)?;
+                let end = MemoryRef::parse_index(end, "end", ctx)?;
+                if end < start {
+                    return Err(JsError::from_native(JsNativeError::typ().with_message(format!(
+                        "tracer accessed out of bound memory: offset {start}, end {end}"
+                    ))));
+                }
+                // Past the end reads as zeros, as geth pads it: `step` runs before the
+                // instruction grows memory, so reading what it is about to write is routine.
                 let slice = memory
                     .0
-                    .with_inner(|mem| mem.slice_len(start, end - start).to_vec())
-                    .unwrap_or_default();
+                    .with_inner(|view| view.copy_padded(start, end - start))
+                    .unwrap_or_else(|| Ok(Vec::new()))
+                    .map_err(|msg| JsError::from_native(JsNativeError::typ().with_message(msg)))?;
                 to_uint8_array_value(slice, ctx)
             },
             state.clone(),
@@ -670,18 +678,18 @@ fn build_step_memory_object(
                     )
                 })?;
                 let len = memory.len();
-                let offset = MemoryRef::parse_index(args.get_or_undefined(0), "offset", len, ctx)?;
-                let Some(end) = offset.checked_add(32) else {
-                    return Err(MemoryRef::out_of_bounds_error(len, offset, 32));
-                };
-                if end > len {
+                let offset = MemoryRef::parse_index(args.get_or_undefined(0), "offset", ctx)?;
+                if offset.checked_add(32).is_none_or(|end| end > len) {
                     return Err(MemoryRef::out_of_bounds_error(len, offset, 32));
                 }
-                let slice = memory
+                let slice: Vec<u8> = memory
                     .0
-                    .with_inner(|mem| mem.slice_len(offset, 32).to_vec())
+                    .with_inner(|view| {
+                        (offset..offset + 32).map(|i| view.byte(i).unwrap_or(0)).collect()
+                    })
                     .unwrap_or_default();
-                to_uint8_array_value(slice, ctx)
+                // geth returns a big integer here, not a byte array.
+                to_bigint(U256::from_be_slice(&slice), ctx)
             },
             state.clone(),
         ),
@@ -725,7 +733,7 @@ fn build_step_contract_object(
     let get_value = FunctionObjectBuilder::new(
         ctx.realm(),
         NativeFunction::from_copy_closure_with_captures(
-            move |_this, _args, state, _ctx| to_bigint(state.0.borrow().contract.value),
+            move |_this, _args, state, ctx| to_bigint(state.0.borrow().contract.value, ctx),
             state.clone(),
         ),
     )
@@ -873,41 +881,115 @@ pub(crate) struct StepLog {
     pub(crate) contract: Contract,
 }
 
-/// An owned snapshot of memory contents.
+/// Upper bound on the zero padding `memory.slice` will synthesize, matching geth's
+/// `memoryPadLimit`.
+const MEMORY_PAD_LIMIT: usize = 1024 * 1024;
+
+/// The range of memory an instruction overwrites, as `(offset, size)`.
 ///
-/// Uses `Rc` internally so cloning is cheap (reference count bump) rather than
-/// copying the entire memory buffer on every step.
+/// Only these opcodes write to memory. Calls are absent because their return data lands after
+/// the child frame returns, which is past `step_end`; `CREATE`, `RETURN`, `KECCAK256` and the
+/// `LOG` family only read.
+fn memory_write_range(op: u8, stack: &[U256]) -> Option<(usize, usize)> {
+    let peek = |n: usize| stack.len().checked_sub(n + 1).map(|i| stack[i]);
+    let (offset, size) = match op {
+        opcode::MSTORE => (peek(0)?, U256::from(32)),
+        opcode::MSTORE8 => (peek(0)?, U256::from(1)),
+        opcode::MCOPY | opcode::CALLDATACOPY | opcode::CODECOPY | opcode::RETURNDATACOPY => {
+            (peek(0)?, peek(2)?)
+        }
+        opcode::EXTCODECOPY => (peek(1)?, peek(3)?),
+        _ => return None,
+    };
+    Some((usize::try_from(offset).ok()?, usize::try_from(size).ok()?))
+}
+
+/// What `step` records so that `step_end` can serve the pre-execution memory.
+///
+/// Copying the whole memory costs time proportional to its size, which reaches milliseconds per
+/// instruction once a contract has grown it to megabytes. Only the bytes the instruction is
+/// about to overwrite are kept; the rest is read back from the post-execution memory.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct MemorySnapshot(Rc<Vec<u8>>);
+pub(crate) struct MemorySnapshot {
+    /// Length before the instruction ran.
+    len: usize,
+    /// Where `patch` starts.
+    patch_offset: usize,
+    /// The pre-execution bytes of the range the instruction overwrites.
+    patch: Vec<u8>,
+}
 
 impl MemorySnapshot {
-    /// Creates a snapshot by copying the context memory from `SharedMemory`.
-    pub(crate) fn from_shared_memory(mem: &SharedMemory) -> Self {
-        Self(Rc::new(mem.context_memory().to_vec()))
+    /// A snapshot of memory that the instruction does not modify, of the given length.
+    pub(crate) fn unchanged(len: usize) -> Self {
+        Self { len, ..Default::default() }
     }
 
-    fn len(&self) -> usize {
-        self.0.len()
+    /// Records the bytes `op` is about to overwrite, given the pre-execution stack and memory.
+    pub(crate) fn record(op: u8, stack: &[U256], memory: &[u8]) -> Self {
+        let mut this = Self { len: memory.len(), ..Default::default() };
+        if let Some((offset, size)) = memory_write_range(op, stack) {
+            if offset < memory.len() && size > 0 {
+                let end = offset.saturating_add(size).min(memory.len());
+                this.patch_offset = offset;
+                this.patch.extend_from_slice(&memory[offset..end]);
+            }
+        }
+        this
+    }
+}
+
+/// The pre-execution memory, reconstructed from a [`MemorySnapshot`] and the memory as it
+/// stands after the instruction ran.
+#[derive(Clone, Debug)]
+pub(crate) struct MemoryView {
+    snapshot: MemorySnapshot,
+    /// Memory after the instruction ran. Kept alive by the [`GcGuard`] handed out with this view.
+    post: &'static [u8],
+}
+
+impl MemoryView {
+    /// The byte at `i` as it was before the instruction ran, or `None` past the end.
+    fn byte(&self, i: usize) -> Option<u8> {
+        if i >= self.snapshot.len {
+            return None;
+        }
+        let patch_len = self.snapshot.patch.len();
+        if i >= self.snapshot.patch_offset && i < self.snapshot.patch_offset + patch_len {
+            return Some(self.snapshot.patch[i - self.snapshot.patch_offset]);
+        }
+        self.post.get(i).copied()
     }
 
-    fn slice_len(&self, offset: usize, size: usize) -> &[u8] {
-        &self.0[offset..offset + size]
+    /// Copies `size` bytes from `offset`, zero-filling whatever lies past the end.
+    fn copy_padded(&self, offset: usize, size: usize) -> Result<Vec<u8>, String> {
+        let len = self.snapshot.len;
+        let padding_needed = offset.saturating_add(size).saturating_sub(len);
+        if padding_needed > MEMORY_PAD_LIMIT {
+            return Err(format!("reached limit for padding memory slice: {padding_needed}"));
+        }
+        Ok((offset..offset.saturating_add(size)).map(|i| self.byte(i).unwrap_or(0)).collect())
     }
 }
 
 /// Represents the memory object
 #[derive(Clone, Debug)]
-pub(crate) struct MemoryRef(GuardedNullableGc<MemorySnapshot>);
+pub(crate) struct MemoryRef(GuardedNullableGc<MemoryView>);
 
 impl MemoryRef {
-    /// Creates a new memory reference from an owned snapshot.
-    pub(crate) fn new_owned(mem: MemorySnapshot) -> (Self, GcGuard<'static, MemorySnapshot>) {
-        let (inner, guard) = GuardedNullableGc::new_owned(mem);
+    /// Pairs the snapshot taken in `step` with the memory as it stands in `step_end`.
+    ///
+    /// The returned guard revokes JavaScript's access to `post`, so it must not outlive it.
+    pub(crate) fn new(snapshot: MemorySnapshot, post: &[u8]) -> (Self, GcGuard<'_, MemoryView>) {
+        // SAFETY: the guard is tied to `post`'s lifetime and clears the view when dropped, so
+        // JavaScript can only reach the reference while it is valid.
+        let post: &'static [u8] = unsafe { core::mem::transmute::<&[u8], &'static [u8]>(post) };
+        let (inner, guard) = GuardedNullableGc::new_owned(MemoryView { snapshot, post });
         (Self(inner), guard)
     }
 
     fn len(&self) -> usize {
-        self.0.with_inner(|mem| mem.len()).unwrap_or_default()
+        self.0.with_inner(|view| view.snapshot.len).unwrap_or_default()
     }
 
     fn invalid_index_error(name: &str, index: impl core::fmt::Display) -> JsError {
@@ -916,14 +998,9 @@ impl MemoryRef {
         )
     }
 
-    fn check_index_bounds(index: usize, name: &str, len: usize) -> JsResult<usize> {
-        if index > len {
-            return Err(Self::invalid_index_error(name, index));
-        }
-        Ok(index)
-    }
-
-    fn parse_index(value: &JsValue, name: &str, len: usize, ctx: &mut Context) -> JsResult<usize> {
+    /// Converts a memory index argument, rejecting what is not a non-negative integer index.
+    /// Bounds are left to the caller: `slice` pads past the end, `getUint` does not.
+    fn parse_index(value: &JsValue, name: &str, ctx: &mut Context) -> JsResult<usize> {
         if value.is_undefined() {
             return Err(Self::invalid_index_error(name, "undefined"));
         }
@@ -932,17 +1009,14 @@ impl MemoryRef {
                 return Err(Self::invalid_index_error(name, index));
             }
         }
-        // Boa's `ToIndex` rejects BigInt, but stack-derived tracer values are BigInt.
+        // Boa's `ToIndex` rejects BigInt, which a script may pass as `10n`.
         if let Some(index) = value.as_bigint() {
             let index = index.to_string();
-            let index =
-                index.parse::<usize>().map_err(|_| Self::invalid_index_error(name, &index))?;
-            return Self::check_index_bounds(index, name, len);
+            return index.parse::<usize>().map_err(|_| Self::invalid_index_error(name, &index));
         }
 
         let index = value.to_index(ctx)?;
-        let index = usize::try_from(index).map_err(|_| Self::invalid_index_error(name, index))?;
-        Self::check_index_bounds(index, name, len)
+        usize::try_from(index).map_err(|_| Self::invalid_index_error(name, index))
     }
 
     fn out_of_bounds_error(len: usize, offset: usize, size: usize) -> JsError {
@@ -960,17 +1034,45 @@ unsafe impl Trace for MemoryRef {
 
 /// Represents the state object
 #[derive(Clone, Debug)]
-pub(crate) struct StateRef(GuardedNullableGc<EvmState>);
+pub(crate) struct StateRef {
+    state: GuardedNullableGc<EvmState>,
+    /// Whether the transaction is over, so a self-destructed account is gone, as geth's
+    /// `Finalise` deletes it. Until then it keeps its code, nonce and storage.
+    finalised: bool,
+}
 
 impl StateRef {
-    /// Creates a new stack reference
-    pub(crate) fn new(state: &EvmState) -> (Self, GcGuard<'_, EvmState>) {
+    /// Creates a new state reference
+    pub(crate) fn new(state: &EvmState, finalised: bool) -> (Self, GcGuard<'_, EvmState>) {
         let (inner, guard) = GuardedNullableGc::new_ref(state);
-        (Self(inner), guard)
+        (Self { state: inner, finalised }, guard)
     }
 
-    fn get_account(&self, address: &Address) -> Option<AccountInfo> {
-        self.0.with_inner(|state| state.get(address).map(|acc| acc.info.clone()))?
+    /// The account as the transaction has left it so far: `Some(None)` once the transaction is
+    /// over and it self-destructed, so the account no longer exists, or `None` if the
+    /// transaction has not touched it and the database holds the answer.
+    fn get_account(&self, address: &Address) -> Option<Option<AccountInfo>> {
+        self.state.with_inner(|state| {
+            let acc = state.get(address)?;
+            Some((!(self.finalised && acc.is_selfdestructed())).then(|| acc.info.clone()))
+        })?
+    }
+
+    /// The slot's value as the transaction has left it so far, or `None` if the transaction has
+    /// not touched it and the database holds the answer. A contract created by this transaction
+    /// starts with empty storage, so its untouched slots are zero rather than whatever the
+    /// database has for that address.
+    fn get_storage(&self, address: &Address, slot: U256) -> Option<U256> {
+        self.state.with_inner(|state| {
+            let acc = state.get(address)?;
+            if self.finalised && acc.is_selfdestructed() {
+                return Some(U256::ZERO);
+            }
+            acc.storage
+                .get(&slot)
+                .map(|slot| slot.present_value())
+                .or_else(|| acc.is_created().then_some(U256::ZERO))
+        })?
     }
 }
 
@@ -1013,11 +1115,13 @@ impl From<u8> for OpObj {
 
 /// Represents the stack object
 #[derive(Clone, Debug)]
-pub(crate) struct StackRef(GuardedNullableGc<Stack>);
+pub(crate) struct StackRef(GuardedNullableGc<Vec<U256>>);
 
 impl StackRef {
-    /// Creates a new stack reference from an owned stack.
-    pub(crate) fn new_owned(stack: Stack) -> (Self, GcGuard<'static, Stack>) {
+    /// Takes ownership of a snapshot of the stack, bottom-first.
+    ///
+    /// Owned for the same reason as [`MemoryRef::new`]: the hook runs after the instruction.
+    pub(crate) fn new<'a>(stack: Vec<U256>) -> (Self, GcGuard<'a, Vec<U256>>) {
         let (inner, guard) = GuardedNullableGc::new_owned(stack);
         (Self(inner), guard)
     }
@@ -1032,19 +1136,17 @@ impl StackRef {
         Ok(index as usize)
     }
 
-    fn peek(&self, idx: usize) -> JsResult<JsValue> {
+    fn peek(&self, idx: usize, ctx: &mut Context) -> JsResult<JsValue> {
         self.0
             .with_inner(|stack| {
-                stack
-                    .peek(idx)
-                    .map_err(|_| {
-                        JsError::from_native(JsNativeError::typ().with_message(format!(
-                            "tracer accessed out of bound stack: size {}, index {}",
-                            stack.len(),
-                            idx
-                        )))
-                    })
-                    .and_then(to_bigint)
+                // `idx` counts from the top, as `Stack::peek` does.
+                stack.len().checked_sub(idx + 1).map(|pos| stack[pos]).ok_or_else(|| {
+                    JsError::from_native(JsNativeError::typ().with_message(format!(
+                        "tracer accessed out of bound stack: size {}, index {}",
+                        stack.len(),
+                        idx
+                    )))
+                })
             })
             .ok_or_else(|| {
                 JsError::from_native(
@@ -1052,6 +1154,7 @@ impl StackRef {
                         .with_message("tracer accessed stack after it was dropped".to_string()),
                 )
             })?
+            .and_then(|value| to_bigint(value, ctx))
     }
 }
 
@@ -1080,8 +1183,60 @@ pub(crate) struct FrameResult {
 /// Represents the call frame object for enter functions
 pub(crate) struct CallFrame {
     pub(crate) contract: Contract,
-    pub(crate) kind: CallKind,
+    /// The value `getType()` reports. A plain string rather than a `CallKind` because
+    /// selfdestruct is reported as its own frame type, which `CallKind` does not model.
+    pub(crate) kind: &'static str,
     pub(crate) gas: u64,
+}
+
+/// Defines `name` on `obj` as a big integer materialised on first read, since converting
+/// eagerly would evaluate the whole `bigInt` library per `result()` call. The accessor stores
+/// what it materialises and what the script assigns, so it reads like the plain property
+/// go-ethereum exposes: the same object on every read, and an assignment sticks, also one made
+/// before any read.
+///
+/// It must stay an accessor: redefining the property from inside its own getter or setter
+/// corrupts Boa's inline cache, which pairs the slot it went through with the object's shape
+/// *after* the call, so the next access from the same expression misreads the property.
+fn define_lazy_bigint(
+    obj: &JsObject,
+    name: &'static str,
+    value: U256,
+    ctx: &mut Context,
+) -> JsResult<()> {
+    let cell = Gc::new(GcRefCell::new(None::<JsValue>));
+    let getter = NativeFunction::from_copy_closure_with_captures(
+        move |_this, _args, cell: &Gc<GcRefCell<Option<JsValue>>>, ctx| {
+            if let Some(current) = cell.borrow().clone() {
+                return Ok(current);
+            }
+            let big_int = to_bigint(value, ctx)?;
+            *cell.borrow_mut() = Some(big_int.clone());
+            Ok(big_int)
+        },
+        cell.clone(),
+    )
+    .to_js_function(ctx.realm());
+    let setter = NativeFunction::from_copy_closure_with_captures(
+        |_this, args, cell: &Gc<GcRefCell<Option<JsValue>>>, _ctx| {
+            *cell.borrow_mut() = Some(args.get_or_undefined(0).clone());
+            Ok(JsValue::undefined())
+        },
+        cell,
+    )
+    .to_js_function(ctx.realm());
+
+    obj.define_property_or_throw(
+        JsString::from(name),
+        PropertyDescriptor::builder()
+            .get(getter)
+            .set(setter)
+            .enumerable(true)
+            .configurable(true)
+            .build(),
+        ctx,
+    )?;
+    Ok(())
 }
 
 /// The `ctx` object that represents the context in which the transaction is executed.
@@ -1097,9 +1252,12 @@ pub(crate) struct JsEvmContext {
     pub(crate) gas: u64,
     /// Number, amount of gas used in executing the transaction (excludes txdata costs)
     pub(crate) gas_used: u64,
-    /// Number, gas price configured in the transaction being executed
-    pub(crate) gas_price: u64,
-    /// Number, intrinsic gas for the transaction being executed
+    /// big.int, the effective gas price of the transaction being executed: base fee plus tip,
+    /// capped at the fee cap. This is the price the sender pays per gas, so `gasUsed * gasPrice`
+    /// is the execution fee.
+    pub(crate) gas_price: U256,
+    /// Number, intrinsic gas of the transaction. go-ethereum dropped this field in #26048, so it
+    /// has no geth counterpart. Not implemented here either: the value is always 0.
     pub(crate) intrinsic_gas: u64,
     /// big.int Amount to be transferred in wei
     pub(crate) value: U256,
@@ -1108,7 +1266,8 @@ pub(crate) struct JsEvmContext {
     /// Address, miner of the block
     pub(crate) coinbase: Address,
     pub(crate) output: Bytes,
-    /// Number, block timestamp
+    /// Number, block timestamp. go-ethereum's `ctx.time` held the tracer's wall time and was
+    /// dropped in #26291 for determinism; a block timestamp keeps the output deterministic.
     pub(crate) time: String,
     pub(crate) transaction_ctx: TransactionContext,
     /// returns information about the error if one occurred, otherwise returns undefined
@@ -1149,9 +1308,9 @@ impl JsEvmContext {
         obj.set(js_string!("input"), to_uint8_array(input, ctx)?, false, ctx)?;
         obj.set(js_string!("gas"), gas, false, ctx)?;
         obj.set(js_string!("gasUsed"), gas_used, false, ctx)?;
-        obj.set(js_string!("gasPrice"), gas_price, false, ctx)?;
+        define_lazy_bigint(&obj, "gasPrice", gas_price, ctx)?;
         obj.set(js_string!("intrinsicGas"), intrinsic_gas, false, ctx)?;
-        obj.set(js_string!("value"), to_bigint(value)?, false, ctx)?;
+        define_lazy_bigint(&obj, "value", value, ctx)?;
         obj.set(js_string!("block"), block, false, ctx)?;
         obj.set(js_string!("coinbase"), address_to_uint8_array(coinbase, ctx)?, false, ctx)?;
         obj.set(js_string!("output"), to_uint8_array(output, ctx)?, false, ctx)?;
@@ -1173,6 +1332,21 @@ impl JsEvmContext {
     }
 }
 
+/// The state an instruction is about to change, captured before it runs.
+///
+/// The `step` hook fires after the instruction has run, once its cost is known, but has to see
+/// the state as it was before, like geth's `OnOpcode`. Within a single instruction revm changes
+/// state only for `SSTORE` (one slot) and `SELFDESTRUCT` (the balances it moves); calls and
+/// creations change it later, when the new frame starts. Recording those few values is enough
+/// to answer `db` reads as of before the instruction.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct PreStepState {
+    /// Accounts as they were, `None` if the account did not exist.
+    pub(crate) accounts: Vec<(Address, Option<AccountInfo>)>,
+    /// A storage slot and its value as it was.
+    pub(crate) slot: Option<(Address, U256, U256)>,
+}
+
 /// DB is the object that allows the js inspector to interact with the database.
 #[derive(Clone)]
 pub(crate) struct EvmDbRef {
@@ -1192,7 +1366,48 @@ impl EvmDbRef {
         DB: Database,
         DB::Error: core::fmt::Display,
     {
-        let (state, state_guard) = StateRef::new(state);
+        Self::with_pre_state(state, db, PreStepState::default())
+    }
+
+    /// Like [`Self::new`], but for the state the transaction has left behind: an account it
+    /// self-destructed reads as absent, as it does to geth's `GetResult`, which runs after
+    /// `Finalise` has deleted it.
+    pub(crate) fn finalised<'a, 'b, DB>(
+        state: &'a EvmState,
+        db: &'b mut DB,
+    ) -> (Self, EvmDbGuard<'a, 'b>)
+    where
+        DB: Database,
+        DB::Error: core::fmt::Display,
+    {
+        Self::build(state, db, PreStepState::default(), true)
+    }
+
+    /// Like [`Self::new`], but answers reads of what `pre_state` covers from it, so the view is
+    /// the state before the instruction that `pre_state` was captured for.
+    pub(crate) fn with_pre_state<'a, 'b, DB>(
+        state: &'a EvmState,
+        db: &'b mut DB,
+        pre_state: PreStepState,
+    ) -> (Self, EvmDbGuard<'a, 'b>)
+    where
+        DB: Database,
+        DB::Error: core::fmt::Display,
+    {
+        Self::build(state, db, pre_state, false)
+    }
+
+    fn build<'a, 'b, DB>(
+        state: &'a EvmState,
+        db: &'b mut DB,
+        pre_state: PreStepState,
+        finalised: bool,
+    ) -> (Self, EvmDbGuard<'a, 'b>)
+    where
+        DB: Database,
+        DB::Error: core::fmt::Display,
+    {
+        let (state, state_guard) = StateRef::new(state, finalised);
 
         // SAFETY:
         //
@@ -1210,7 +1425,7 @@ impl EvmDbRef {
 
         let (db, db_guard) = GcDb::new(js_db);
 
-        let inner = EvmDbRefInner { state, db };
+        let inner = EvmDbRefInner { state, db, pre_state };
         let this = Self { inner: Rc::new(inner) };
         let guard = EvmDbGuard { _state_guard: state_guard, _db_guard: db_guard };
         (this, guard)
@@ -1219,7 +1434,12 @@ impl EvmDbRef {
     fn read_basic(&self, address: JsValue, ctx: &mut Context) -> JsResult<Option<AccountInfo>> {
         let buf = bytes_from_value(address, ctx)?;
         let address = bytes_to_address(&buf);
-        if let acc @ Some(_) = self.inner.state.get_account(&address) {
+        if let Some((_, acc)) = self.inner.pre_state.accounts.iter().find(|(a, _)| *a == address) {
+            return Ok(acc.clone());
+        }
+        // A destroyed account is gone, not merely unknown: the database must not answer for it,
+        // since before EIP-6780 it may still hold the account as it was before the transaction.
+        if let Some(acc) = self.inner.state.get_account(&address) {
             return Ok(acc);
         }
 
@@ -1267,13 +1487,26 @@ impl EvmDbRef {
         let buf = bytes_from_value(slot, ctx)?;
         let slot = bytes_to_b256(&buf);
 
-        let res = self.inner.db.0.with_inner(|db| db.storage_ref(address, slot.into()));
+        let slot = U256::from_be_bytes(slot.0);
+        if let Some((_, _, value)) =
+            self.inner.pre_state.slot.filter(|(a, s, _)| *a == address && *s == slot)
+        {
+            return to_uint8_array(B256::from(value), ctx);
+        }
+        // geth reads the live state, so a slot this transaction has written reads back the
+        // written value rather than the one committed before the transaction.
+        if let Some(value) = self.inner.state.get_storage(&address, slot) {
+            return to_uint8_array(B256::from(value), ctx);
+        }
+
+        let res = self.inner.db.0.with_inner(|db| db.storage_ref(address, slot));
 
         let value = match res {
             Some(Ok(value)) => value,
             _ => {
                 return Err(JsError::from_native(JsNativeError::error().with_message(format!(
-                    "Failed to read state for {address:?} at {slot:?} from database",
+                    "Failed to read state for {address:?} at {:?} from database",
+                    B256::from(slot)
                 ))))
             }
         };
@@ -1304,7 +1537,7 @@ impl EvmDbRef {
                     let val = args.get_or_undefined(0).clone();
                     let acc = db.read_basic(val, ctx)?;
                     let balance = acc.map(|acc| acc.balance).unwrap_or_default();
-                    to_bigint(balance)
+                    to_bigint(balance, ctx)
                 },
                 self.clone(),
             ),
@@ -1373,6 +1606,7 @@ unsafe impl Trace for EvmDbRef {
 struct EvmDbRefInner {
     state: StateRef,
     db: GcDb<Box<dyn DatabaseRef<Error = StringError> + 'static>>,
+    pre_state: PreStepState,
 }
 
 /// Guard the inner references, once this value is dropped the inner reference is also removed.
@@ -1437,7 +1671,7 @@ mod tests {
     use super::*;
     use crate::tracing::js::builtins::{json_stringify, register_builtins, to_serde_value};
     use boa_engine::Source;
-    use revm::{database::CacheDB, database_interface::EmptyDB};
+    use revm::{database::CacheDB, database_interface::EmptyDB, interpreter::Stack};
 
     #[test]
     fn test_contract() {
@@ -1450,10 +1684,8 @@ mod tests {
         };
         register_builtins(&mut ctx).unwrap();
 
-        let stack = Stack::new();
-        let (stack_ref, _stack_guard) = StackRef::new_owned(stack);
-        let mem = MemorySnapshot::default();
-        let (mem_ref, _mem_guard) = MemoryRef::new_owned(mem);
+        let (stack_ref, _stack_guard) = StackRef::new(Vec::new());
+        let (mem_ref, _mem_guard) = MemoryRef::new(MemorySnapshot::unchanged(0), &[]);
         let step = StepLog {
             stack: stack_ref,
             op: OpObj(0),
@@ -1642,9 +1874,8 @@ mod tests {
         let _ = stack.push(U256::from(35000));
         let _ = stack.push(U256::from(35000));
         let _ = stack.push(U256::from(35000));
-        let (stack_ref, _stack_guard) = StackRef::new_owned(stack);
-        let mem = MemorySnapshot::default();
-        let (mem_ref, _mem_guard) = MemoryRef::new_owned(mem);
+        let (stack_ref, _stack_guard) = StackRef::new(stack.data().clone());
+        let (mem_ref, _mem_guard) = MemoryRef::new(MemorySnapshot::unchanged(0), &[]);
 
         let step = StepLog {
             stack: stack_ref,
@@ -1733,9 +1964,8 @@ mod tests {
         let _ = stack.push(U256::from(35000));
         let _ = stack.push(U256::from(35000));
         let _ = stack.push(U256::from(35000));
-        let (stack_ref, _stack_guard) = StackRef::new_owned(stack);
-        let mem = MemorySnapshot::default();
-        let (mem_ref, _mem_guard) = MemoryRef::new_owned(mem);
+        let (stack_ref, _stack_guard) = StackRef::new(stack.data().clone());
+        let (mem_ref, _mem_guard) = MemoryRef::new(MemorySnapshot::unchanged(0), &[]);
 
         let step = StepLog {
             stack: stack_ref,

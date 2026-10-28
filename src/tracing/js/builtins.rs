@@ -6,8 +6,8 @@ use boa_engine::{
     builtins::{array_buffer::ArrayBuffer, typed_array::TypedArray},
     js_string,
     object::builtins::{JsArray, JsArrayBuffer, JsTypedArray, JsUint8Array},
-    property::Attribute,
-    Context, JsArgs, JsBigInt, JsError, JsNativeError, JsResult, JsString, JsValue, NativeFunction,
+    property::PropertyDescriptor,
+    Context, JsArgs, JsData, JsError, JsNativeError, JsResult, JsString, JsValue, NativeFunction,
     Source,
 };
 use boa_gc::{empty_trace, Finalize, Trace};
@@ -15,35 +15,36 @@ use core::borrow::Borrow;
 
 /// Converts the given `JsValue` to a `serde_json::Value`.
 ///
-/// This first attempts to use the built-in `JSON.stringify` function to convert the value to a JSON
-///
-/// If that fails it uses boa's to_json function to convert the value to a JSON object
-///
-/// We use `JSON.stringify` so that `toJSON` properties are used when converting the value to JSON,
-/// this ensures the `bigint` is serialized properly.
+/// Serialization goes through `JSON.stringify` so that `toJSON` properties are honoured, which
+/// is what lets a big integer come out as a decimal string. Boa's own `to_json` is the
+/// fallback; if it fails too, the `JSON.stringify` error is reported, being the informative
+/// one - a circular structure names itself there and not in the fallback.
 pub(crate) fn to_serde_value(val: JsValue, ctx: &mut Context) -> JsResult<serde_json::Value> {
-    if let Ok(json) = json_stringify(val.clone(), ctx) {
-        let json = json.to_std_string().map_err(|err| {
-            JsError::from_native(
-                JsNativeError::error()
-                    .with_message(format!("failed to convert JSON to string: {err}")),
-            )
-        })?;
-        serde_json::from_str(&json).map_err(|err| {
-            JsError::from_native(
-                JsNativeError::error().with_message(format!("failed to parse JSON: {err}")),
-            )
-        })
-    } else {
-        val.to_json(ctx)?.ok_or_else(|| {
-            JsError::from_native(
-                JsNativeError::error().with_message("failed to convert JsValue to JSON"),
-            )
-        })
-    }
+    let stringify_err = match json_stringify(val.clone(), ctx) {
+        Ok(json) => {
+            let json = json.to_std_string().map_err(|err| {
+                JsError::from_native(
+                    JsNativeError::error()
+                        .with_message(format!("failed to convert JSON to string: {err}")),
+                )
+            })?;
+            return serde_json::from_str(&json).map_err(|err| {
+                JsError::from_native(
+                    JsNativeError::error().with_message(format!("failed to parse JSON: {err}")),
+                )
+            });
+        }
+        Err(err) => err,
+    };
+
+    val.to_json(ctx)?.ok_or(stringify_err)
 }
 
 /// Attempts to use the global `JSON` object to stringify the given value.
+///
+/// `JSON.stringify` answers the JavaScript value `undefined` for `undefined`, functions and
+/// symbols. Rendering that as the *string* `"undefined"` would produce text no JSON parser
+/// accepts, so it is mapped to `null`, as go-ethereum's `json.Marshal` does.
 pub(crate) fn json_stringify(val: JsValue, ctx: &mut Context) -> JsResult<JsString> {
     let json = ctx.global_object().get(js_string!("JSON"), ctx)?;
     let json_obj = json.as_object().ok_or_else(|| {
@@ -56,7 +57,107 @@ pub(crate) fn json_stringify(val: JsValue, ctx: &mut Context) -> JsResult<JsStri
         JsError::from_native(JsNativeError::typ().with_message("JSON.stringify is not callable"))
     })?;
     let res = stringify.call(&json, &[val], ctx)?;
+    if res.is_undefined() {
+        return Ok(js_string!("null"));
+    }
     res.to_string(ctx)
+}
+
+/// The `bigInt` environment go-ethereum exposes to JS tracers, verbatim.
+///
+/// See `src/tracing/js/bigint.js` for provenance.
+const BIG_INT_JS: &str = include_str!("bigint.js");
+
+/// The global names the constructor is reachable under: `bigInt` is geth's, `bigint` an alias.
+/// Both resolve to the same object.
+const BIG_INT_GLOBALS: [&str; 2] = ["bigInt", "bigint"];
+
+/// Parses and evaluates the library, returning its constructor. The IIFE keeps its top-level
+/// `var bigInt` function-scoped: at global scope it would not displace the accessor from
+/// [`install_bigint`], and the trailing `bigInt` expression would re-enter it forever.
+fn eval_bigint(ctx: &mut Context) -> JsResult<JsValue> {
+    let src = format!("(function(){{\n{BIG_INT_JS}\n;return bigInt}})()");
+    let big_int = ctx.eval(Source::from_bytes(src.as_str()))?;
+    if !big_int.is_callable() {
+        return Err(JsError::from_native(
+            JsNativeError::typ().with_message("failed to install the bigInt environment"),
+        ));
+    }
+    Ok(big_int)
+}
+
+/// What each of [`BIG_INT_GLOBALS`] holds once the script has assigned it; `None` until then,
+/// which reads as the library's constructor.
+#[derive(Debug, Default, Trace, Finalize, JsData)]
+struct BigIntGlobals([Option<JsValue>; 2]);
+
+/// Reads one of [`BIG_INT_GLOBALS`]: the script's value if it assigned one, else the library's
+/// constructor, evaluating the library on first access.
+fn bigint_global_getter(
+    _this: &JsValue,
+    _args: &[JsValue],
+    index: &usize,
+    ctx: &mut Context,
+) -> JsResult<JsValue> {
+    if let Some(value) = ctx.get_data::<BigIntGlobals>().and_then(|g| g.0[*index].clone()) {
+        return Ok(value);
+    }
+    bigint_constructor(ctx)
+}
+
+/// Assigns one of [`BIG_INT_GLOBALS`]; the sibling alias keeps its own value, as two ordinary
+/// globals would.
+fn bigint_global_setter(
+    _this: &JsValue,
+    args: &[JsValue],
+    index: &usize,
+    ctx: &mut Context,
+) -> JsResult<JsValue> {
+    let mut globals = ctx.remove_data::<BigIntGlobals>().map(|g| *g).unwrap_or_default();
+    globals.0[*index] = Some(args.get_or_undefined(0).clone());
+    ctx.insert_data(globals);
+    Ok(JsValue::undefined())
+}
+
+/// The library's constructor, held by the host so that conversions keep working whatever the
+/// script does to the globals, as geth holds it in a Go-side handle.
+#[derive(Debug, Trace, Finalize, JsData)]
+struct BigIntConstructor(JsValue);
+
+/// Returns the library's constructor, evaluating the library the first time it is needed.
+fn bigint_constructor(ctx: &mut Context) -> JsResult<JsValue> {
+    if let Some(BigIntConstructor(big_int)) = ctx.get_data::<BigIntConstructor>() {
+        return Ok(big_int.clone());
+    }
+    let big_int = eval_bigint(ctx)?;
+    ctx.insert_data(BigIntConstructor(big_int.clone()));
+    Ok(big_int)
+}
+
+/// Installs go-ethereum's `bigInt` environment lazily: parsing the 26 KB library dwarfs
+/// building the [`Context`], and a fresh one is built per traced transaction. Triggering on
+/// property access cannot miss a reference such as `globalThis['big' + 'Int']`.
+///
+/// The globals stay accessors for good, with the values kept by the host. Redefining one from
+/// inside its own getter or setter would corrupt Boa's inline cache: the global lookup caches
+/// the slot it read through together with the object's shape *after* the call, so the next
+/// lookup from the same expression takes the new value for a getter and calls it.
+fn install_bigint(ctx: &mut Context) -> JsResult<()> {
+    ctx.insert_data(BigIntGlobals::default());
+    for (index, name) in BIG_INT_GLOBALS.into_iter().enumerate() {
+        let getter = NativeFunction::from_copy_closure_with_captures(bigint_global_getter, index)
+            .to_js_function(ctx.realm());
+        let setter = NativeFunction::from_copy_closure_with_captures(bigint_global_setter, index)
+            .to_js_function(ctx.realm());
+        let desc = PropertyDescriptor::builder()
+            .get(getter)
+            .set(setter)
+            .enumerable(true)
+            .configurable(true)
+            .build();
+        ctx.global_object().define_property_or_throw(JsString::from(name), desc, ctx)?;
+    }
+    Ok(())
 }
 
 /// Registers all the builtin functions.
@@ -64,16 +165,10 @@ pub(crate) fn json_stringify(val: JsValue, ctx: &mut Context) -> JsResult<JsStri
 /// Note: this does not register the `isPrecompiled` builtin, as this requires the precompile
 /// addresses, see [PrecompileList::register_callable].
 pub(crate) fn register_builtins(ctx: &mut Context) -> JsResult<()> {
-    let big_int = ctx.global_object().get(js_string!("BigInt"), ctx)?;
-    // Add toJSON method and geth-compatible polyfill shims to BigInt prototype.
-    //
-    // Geth's JS tracer uses the BigInteger.js polyfill (peterolson/BigInteger.js) which exposes
-    // a global `bigInt` (camelCase) function returning objects with methods like `.equals()`,
-    // `.toJSNumber()`, `.plus()`, `.minus()`, etc. Reth uses Boa's native BigInt which lacks
-    // these methods. We add shims so geth-compatible tracers (including geth's built-in
-    // call_tracer_legacy.js) work unmodified.
-    //
-    // See: https://github.com/ethereum/go-ethereum/blob/master/eth/tracers/js/bigint.go
+    install_bigint(ctx)?;
+    // Additive shims on Boa's *native* `BigInt`, which goja lacks entirely; BigInteger.js
+    // values sit on a disjoint prototype chain, so these cannot affect them. `toJSON` is
+    // load-bearing: `JSON.stringify` in `to_serde_value` throws on a bare native BigInt.
     ctx.eval(Source::from_bytes(
         br#"
 BigInt.prototype.toJSON = function() { return this.toString(); };
@@ -83,12 +178,6 @@ BigInt.prototype.plus = function(other) { return this + BigInt(other); };
 BigInt.prototype.minus = function(other) { return this - BigInt(other); };
 "#,
     ))?;
-    // Create global 'bigint' alias for native BigInt constructor (lowercase for compatibility)
-    ctx.register_global_property(js_string!("bigint"), big_int.clone(), Attribute::all())?;
-    // Create global 'bigInt' alias (camelCase) for geth BigInteger.js polyfill compatibility.
-    // Geth's goja engine runs `var bigInt = function(){...}()` at global scope, making `bigInt`
-    // the standard way to construct big integers in geth JS tracers.
-    ctx.register_global_property(js_string!("bigInt"), big_int, Attribute::all())?;
     ctx.register_global_builtin_callable(
         js_string!("toHex"),
         1,
@@ -213,13 +302,13 @@ pub(crate) fn bytes_to_fb<const N: usize>(mut bytes: &[u8]) -> FixedBytes<N> {
     FixedBytes::left_padding_from(bytes)
 }
 
-/// Converts a U256 to a Boa bigint value.
-pub(crate) fn to_bigint(value: U256) -> JsResult<JsValue> {
-    JsBigInt::from_string(&value.to_string()).map(Into::into).ok_or_else(|| {
-        JsError::from_native(
-            JsNativeError::error().with_message("failed to convert U256 to BigInt"),
-        )
-    })
+/// Converts a U256 to a bigint with the library's constructor. The value is passed as a decimal
+/// string, matching geth, whose `toBig` is likewise handed `value.String()`; BigInteger.js
+/// accepts only decimal in its single-argument form, so a hex string would throw.
+pub(crate) fn to_bigint(value: U256, ctx: &mut Context) -> JsResult<JsValue> {
+    let bigint = bigint_constructor(ctx)?;
+    let bigint = bigint.as_callable().expect("eval_bigint returns a callable");
+    bigint.call(&JsValue::undefined(), &[JsValue::from(js_string!(value.to_string()))], ctx)
 }
 
 /// Compute the address of a contract created using CREATE2.
@@ -338,15 +427,19 @@ pub(crate) fn slice(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResul
     let val = args.get_or_undefined(0).clone();
 
     let buf = bytes_from_value(val, ctx)?;
-    let start = args.get_or_undefined(1).to_numeric_number(ctx)? as usize;
-    let end = args.get_or_undefined(2).to_numeric_number(ctx)? as usize;
+    // Test the floats before converting: `f64 as usize` saturates, so `-1.0` would silently
+    // become `0` and return a slice geth rejects. `MemoryRef::slice` guards the same way.
+    let start_f64 = args.get_or_undefined(1).to_numeric_number(ctx)?;
+    let end_f64 = args.get_or_undefined(2).to_numeric_number(ctx)?;
+    let start = start_f64 as usize;
+    let end = end_f64 as usize;
 
-    if start > end || end > buf.len() {
+    if start_f64 < 0. || end_f64 < 0. || start > end || end > buf.len() {
         Err(JsError::from_native(JsNativeError::error().with_message(format!(
             "Tracer accessed out of bound memory: available {}, start {}, end {}",
             buf.len(),
-            start,
-            end
+            start_f64,
+            end_f64
         ))))
     } else {
         to_uint8_array_value(buf[start..end].iter().copied(), ctx)
@@ -398,8 +491,18 @@ mod tests {
         let value = JsValue::from(js_string!("100"));
         let result =
             bigint.as_callable().unwrap().call(&JsValue::undefined(), &[value], &mut ctx).unwrap();
-        assert!(result.is_bigint());
+        // BigInteger.js hands back an object, not a native bigint primitive - same as geth.
+        assert!(result.is_object());
+        assert!(!result.is_bigint());
         assert_eq!(result.to_string(&mut ctx).unwrap().to_std_string().unwrap(), "100");
+
+        // `bigInt` (what tracers call) and `bigint` (what `to_bigint` looks up) must be the
+        // very same constructor, otherwise values from the two would not interoperate.
+        let same = ctx.eval(Source::from_bytes(b"bigInt === bigint")).unwrap();
+        assert!(same.as_boolean().unwrap());
+
+        // The library supplies its own `toJSON`, which `to_serde_value` relies on.
+        assert_eq!(json_stringify(result, &mut ctx).unwrap().to_std_string().unwrap(), "\"100\"");
     }
 
     #[test]
@@ -420,27 +523,211 @@ mod tests {
         ];
 
         for (value, expected) in test_cases {
-            let result = to_bigint(value).unwrap();
-            assert!(result.is_bigint(), "Result should be a bigint for value {value}");
+            let result = to_bigint(value, &mut ctx).unwrap();
+            assert!(result.is_object(), "Result should be a BigInteger object for value {value}");
             let result_str = result.to_string(&mut ctx).unwrap().to_std_string().unwrap();
             assert_eq!(result_str, expected, "BigInt conversion failed for {value}");
         }
 
         // Test that the result can be used in JavaScript operations
         let big_value = U256::from(999u64);
-        let bigint_result = to_bigint(big_value).unwrap();
+        let bigint_result = to_bigint(big_value, &mut ctx).unwrap();
 
         // Set it as a global variable
         ctx.global_object().set(js_string!("testBigInt"), bigint_result, false, &mut ctx).unwrap();
 
-        // Test arithmetic with it
-        let arithmetic_test = ctx.eval(Source::from_bytes(b"testBigInt + BigInt(1)")).unwrap();
-        assert!(arithmetic_test.is_bigint());
+        // Arithmetic goes through the library's own methods, as it does in geth.
+        let arithmetic_test =
+            ctx.eval(Source::from_bytes(b"testBigInt.add(1).toString()")).unwrap();
         assert_eq!(arithmetic_test.to_string(&mut ctx).unwrap().to_std_string().unwrap(), "1000");
 
         // Test comparison
-        let comparison_test = ctx.eval(Source::from_bytes(b"testBigInt > BigInt(500)")).unwrap();
+        let comparison_test = ctx.eval(Source::from_bytes(b"testBigInt.greater(500)")).unwrap();
         assert!(comparison_test.as_boolean().unwrap());
+
+        // Values are objects now, so `typeof` reports "object" and `+` coerces through
+        // `valueOf` to a Number instead of throwing the way a native bigint would. Both
+        // match go-ethereum; pinned here so the change is visible if it ever regresses.
+        let type_of = ctx.eval(Source::from_bytes(b"typeof testBigInt")).unwrap();
+        assert_eq!(type_of.to_string(&mut ctx).unwrap().to_std_string().unwrap(), "object");
+        let coerced = ctx.eval(Source::from_bytes(b"testBigInt + 1")).unwrap();
+        assert_eq!(coerced.as_number().unwrap(), 1000.0);
+    }
+
+    /// Evaluates `src` in a context with the builtins installed and returns its string value.
+    fn eval_str(src: &str) -> String {
+        let mut ctx = Context::default();
+        register_builtins(&mut ctx).unwrap();
+        ctx.eval(Source::from_bytes(src.as_bytes()))
+            .unwrap()
+            .to_string(&mut ctx)
+            .unwrap()
+            .to_std_string()
+            .unwrap()
+    }
+
+    /// The library must not be evaluated until something reaches for `bigInt`. Parsing it
+    /// costs ~45x what building the whole [`Context`] does and is paid per traced
+    /// transaction, so a regression here is expensive and otherwise invisible.
+    #[test]
+    fn test_bigint_is_installed_lazily() {
+        let mut ctx = Context::default();
+        register_builtins(&mut ctx).unwrap();
+
+        // Untouched: the library has not been evaluated.
+        assert!(ctx.get_data::<BigIntConstructor>().is_none());
+
+        // Reading it evaluates the library.
+        let value = ctx.eval(Source::from_bytes(b"bigInt(7).toString()")).unwrap();
+        assert_eq!(value.to_string(&mut ctx).unwrap().to_std_string().unwrap(), "7");
+        assert!(ctx.get_data::<BigIntConstructor>().is_some());
+
+        // Both names must end up bound to the same constructor.
+        let same = ctx.eval(Source::from_bytes(b"bigInt === bigint")).unwrap();
+        assert!(same.as_boolean().unwrap());
+    }
+
+    /// Assigning to `bigInt` must not depend on whether the library is installed yet. geth's
+    /// `bigInt` is a plain writable global throughout.
+    #[test]
+    fn test_bigint_global_is_assignable_before_and_after_install() {
+        // Before: assignment goes through the setter.
+        let mut ctx = Context::default();
+        register_builtins(&mut ctx).unwrap();
+        let before = ctx.eval(Source::from_bytes(b"bigInt = 1; typeof bigInt")).unwrap();
+        assert_eq!(before.to_string(&mut ctx).unwrap().to_std_string().unwrap(), "number");
+        // The sibling alias is independent, as two ordinary globals would be: reading it
+        // yields the library for it alone and leaves the assigned one alone.
+        let alias = ctx.eval(Source::from_bytes(b"typeof bigint + ' ' + typeof bigInt")).unwrap();
+        assert_eq!(alias.to_string(&mut ctx).unwrap().to_std_string().unwrap(), "function number");
+        // Nor does a conversion the host makes, such as `stack.peek()`'s, disturb it.
+        let seven = to_bigint(U256::from(7u64), &mut ctx).unwrap();
+        assert_eq!(seven.to_string(&mut ctx).unwrap().to_std_string().unwrap(), "7");
+        let kept = ctx.eval(Source::from_bytes(b"bigInt")).unwrap();
+        assert_eq!(kept, JsValue::from(1));
+
+        // After: assignment still works.
+        let mut ctx = Context::default();
+        register_builtins(&mut ctx).unwrap();
+        let after = ctx
+            .eval(Source::from_bytes(b"bigInt(1).toString(); bigInt = 1; typeof bigInt"))
+            .unwrap();
+        assert_eq!(after.to_string(&mut ctx).unwrap().to_std_string().unwrap(), "number");
+
+        // And strict mode must not throw in either order.
+        let mut ctx = Context::default();
+        register_builtins(&mut ctx).unwrap();
+        assert!(ctx.eval(Source::from_bytes(b"'use strict'; bigInt = 1;")).is_ok());
+    }
+
+    /// Conversions do not go through the globals, so overwriting both leaves them working, as
+    /// in geth.
+    #[test]
+    fn test_conversions_survive_overwritten_globals() {
+        let mut ctx = Context::default();
+        register_builtins(&mut ctx).unwrap();
+        ctx.eval(Source::from_bytes(b"bigInt = 123; bigint = null;")).unwrap();
+        let seven = to_bigint(U256::from(7u64), &mut ctx).unwrap();
+        assert_eq!(seven.to_string(&mut ctx).unwrap().to_std_string().unwrap(), "7");
+        let kept = ctx.eval(Source::from_bytes(b"[bigInt, bigint]")).unwrap();
+        let kept = kept.to_json(&mut ctx).unwrap().unwrap();
+        assert_eq!(kept, serde_json::json!([123, null]));
+    }
+
+    /// Touching the lowercase alias first must install the library just the same.
+    #[test]
+    fn test_bigint_lazy_install_via_lowercase_alias() {
+        let mut ctx = Context::default();
+        register_builtins(&mut ctx).unwrap();
+
+        let result = to_bigint(U256::from(7u64), &mut ctx).unwrap();
+        assert_eq!(result.to_string(&mut ctx).unwrap().to_std_string().unwrap(), "7");
+
+        let same = ctx.eval(Source::from_bytes(b"bigInt === bigint")).unwrap();
+        assert!(same.as_boolean().unwrap());
+    }
+
+    #[test]
+    fn test_bigint_arithmetic() {
+        // The canonical BigInteger.js names, not just the `plus`/`minus` aliases.
+        assert_eq!(eval_str("bigInt(1).add(2).toString()"), "3");
+        assert_eq!(eval_str("bigInt(10).subtract(3).toString()"), "7");
+        assert_eq!(eval_str("bigInt(6).multiply(7).toString()"), "42");
+        assert_eq!(eval_str("bigInt(84).divide(2).toString()"), "42");
+        assert_eq!(eval_str("bigInt(17).mod(5).toString()"), "2");
+        assert_eq!(eval_str("bigInt(2).pow(64).toString()"), "18446744073709551616");
+        assert_eq!(eval_str("bigInt(5).negate().toString()"), "-5");
+        assert_eq!(eval_str("bigInt(-5).abs().toString()"), "5");
+        // Arbitrary precision must hold well past f64.
+        assert_eq!(
+            eval_str("bigInt('9007199254740993').add('9007199254740993').toString()"),
+            "18014398509481986"
+        );
+    }
+
+    #[test]
+    fn test_bigint_compare_and_predicates() {
+        assert_eq!(eval_str("bigInt(1).compare(2).toString()"), "-1");
+        assert_eq!(eval_str("bigInt(2).compare(2).toString()"), "0");
+        assert_eq!(eval_str("bigInt(3).compare(2).toString()"), "1");
+        assert_eq!(eval_str("bigInt(3).greater(2).toString()"), "true");
+        assert_eq!(eval_str("bigInt(1).lesser(2).toString()"), "true");
+        assert_eq!(eval_str("bigInt(2).equals(2).toString()"), "true");
+        assert_eq!(eval_str("bigInt(0).isZero().toString()"), "true");
+        assert_eq!(eval_str("bigInt(-1).isNegative().toString()"), "true");
+        assert_eq!(eval_str("bigInt(4).isEven().toString()"), "true");
+    }
+
+    #[test]
+    fn test_bigint_radix_parsing() {
+        // The two-argument form geth's prestate_tracer_legacy.js depends on.
+        assert_eq!(eval_str("bigInt('ff', 16).toString()"), "255");
+        assert_eq!(eval_str("bigInt('ff', 16).toString(16)"), "ff");
+        assert_eq!(eval_str("bigInt('-ff', 16).toString()"), "-255");
+        assert_eq!(eval_str("bigInt('de0b6b3a7640000', 16).toString()"), "1000000000000000000");
+        assert_eq!(eval_str("bigInt('1010', 2).toString()"), "10");
+
+        // A `0x` prefix is rejected: `x` is not a digit in base 16. geth's tracers strip it
+        // with `.slice(2)` before calling, so preserving this rejection keeps us aligned.
+        let mut ctx = Context::default();
+        register_builtins(&mut ctx).unwrap();
+        assert!(ctx.eval(Source::from_bytes(b"bigInt('0xff', 16)")).is_err());
+    }
+
+    #[test]
+    fn test_bigint_256bit_precision() {
+        let mut ctx = Context::default();
+        register_builtins(&mut ctx).unwrap();
+
+        let result = to_bigint(U256::MAX, &mut ctx).unwrap();
+        assert_eq!(
+            result.to_string(&mut ctx).unwrap().to_std_string().unwrap(),
+            "115792089237316195423570985008687907853269984665640564039457584007913129639935"
+        );
+
+        ctx.global_object().set(js_string!("m"), result, false, &mut ctx).unwrap();
+        let hex = ctx.eval(Source::from_bytes(b"m.toString(16)")).unwrap();
+        assert_eq!(
+            hex.to_string(&mut ctx).unwrap().to_std_string().unwrap(),
+            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        );
+    }
+
+    /// The payload must stay byte-for-byte identical to the one go-ethereum embeds. A 26 KB
+    /// single-line file is easy prey for format-on-save, a prettier hook or CRLF
+    /// normalization, any of which would silently desynchronize us from geth.
+    #[test]
+    fn test_bigint_source_is_geth_verbatim() {
+        let payload = BIG_INT_JS.lines().next_back().unwrap();
+        assert_eq!(payload.len(), 26497);
+        assert!(payload.starts_with("var bigInt=function(undefined){\"use strict\";"));
+        assert!(payload.ends_with("; bigInt"));
+        assert_eq!(
+            alloy_primitives::keccak256(payload),
+            alloy_primitives::b256!(
+                "0xae5b22e16550693c719bbe50e6f126c9dde23104c20662df89d3b41801686529"
+            ),
+        );
     }
 
     fn as_length<T>(array: T) -> usize
