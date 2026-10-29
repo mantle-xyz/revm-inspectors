@@ -79,6 +79,10 @@ impl<'a> GethTraceBuilder<'a> {
         while let Some(CallTraceStepStackItem { trace_node, step, call_child_id }) =
             step_stack.pop_back()
         {
+            if opts.limit.is_some_and(|limit| struct_logs.len() as u64 >= limit) {
+                break;
+            }
+
             // We increment the depth by one because steps that are part of call at depth N should
             // have depth N + 1. For example, steps inside of a top-level call should
             // have depth 1.
@@ -130,7 +134,13 @@ impl<'a> GethTraceBuilder<'a> {
         let main_trace_node = &self.nodes[0];
         let main_trace = &main_trace_node.trace;
 
-        let mut struct_logs = Vec::with_capacity(self.trace_step_count());
+        let opts =
+            GethDefaultTracingOptions { limit: opts.limit.filter(|limit| *limit != 0), ..opts };
+        let capacity = opts.limit.map_or_else(
+            || self.trace_step_count(),
+            |limit| self.trace_step_count().min(usize::try_from(limit).unwrap_or(usize::MAX)),
+        );
+        let mut struct_logs = Vec::with_capacity(capacity);
         let mut storage = HashMap::default();
         self.fill_geth_trace(main_trace_node, &opts, &mut storage, &mut struct_logs);
 
@@ -160,17 +170,19 @@ impl<'a> GethTraceBuilder<'a> {
         let include_logs = opts.with_log.unwrap_or_default();
         // first fill up the root
         let main_trace_node = &self.nodes[0];
-        let mut root_call_frame = main_trace_node.geth_empty_call_frame(include_logs);
+        // like any other failed call, a failed root drops its own logs
+        let root_logs_visible = include_logs && !main_trace_node.trace.is_error();
+        let mut root_call_frame = main_trace_node.geth_empty_call_frame(root_logs_visible);
         root_call_frame.gas_used = U256::from(gas_used);
+
+        if opts.only_top_call.unwrap_or_default() {
+            return root_call_frame;
+        }
 
         // selfdestructs are not recorded as individual call traces but are derived from
         // the call trace and are added as additional `CallFrame` objects to the parent call
         if let Some(selfdestruct) = main_trace_node.geth_selfdestruct_call_trace() {
             root_call_frame.calls.push(selfdestruct);
-        }
-
-        if opts.only_top_call.unwrap_or_default() {
-            return root_call_frame;
         }
 
         // fill all the call frames in the root call frame with the recorded traces.
@@ -265,6 +277,11 @@ impl<'a> GethTraceBuilder<'a> {
         // we only want changed accounts for things like balance changes etc
         for (addr, changed_acc) in account_diffs {
             let db_acc = db.basic_ref(addr)?.unwrap_or_default();
+            // Geth omits accounts that were empty before execution, even if fees fund them.
+            // Check the original code hash before applying the disableCode output option.
+            if account_was_empty(&db_acc) {
+                continue;
+            }
             let code = code_enabled.then(|| load_account_code(&db, &db_acc)).flatten();
             let mut acc_state = AccountState::from_account_info(db_acc.nonce, db_acc.balance, code);
 
@@ -590,6 +607,7 @@ mod tests {
     use super::*;
     use alloy_primitives::{address, U256};
     use revm::{
+        bytecode::Bytecode,
         database::CacheDB,
         database_interface::EmptyDB,
         state::{Account, AccountInfo},
@@ -634,6 +652,63 @@ mod tests {
                 );
             }
             _ => panic!("expected diff prestate frame"),
+        }
+    }
+
+    #[test]
+    fn prestate_omits_initially_empty_accounts() {
+        let absent_beneficiary = Address::with_last_byte(1);
+        let empty_beneficiary = Address::with_last_byte(2);
+        let funded_beneficiary = Address::with_last_byte(3);
+        let nonce_account = Address::with_last_byte(4);
+        let contract = Address::with_last_byte(5);
+        let code = Bytecode::new_legacy(Bytes::from_static(&[0x00]));
+        let mut db = CacheDB::new(EmptyDB::default());
+        db.insert_account_info(empty_beneficiary, AccountInfo::default());
+        db.insert_account_info(
+            funded_beneficiary,
+            AccountInfo { balance: U256::from(10), ..Default::default() },
+        );
+        db.insert_account_info(nonce_account, AccountInfo { nonce: 1, ..Default::default() });
+        db.insert_account_info(
+            contract,
+            AccountInfo {
+                code_hash: code.hash_slow(),
+                code: Some(code.clone()),
+                ..Default::default()
+            },
+        );
+
+        let mut state = EvmState::default();
+        for address in [absent_beneficiary, empty_beneficiary] {
+            state.insert(
+                address,
+                Account::from(AccountInfo { balance: U256::from(1), ..Default::default() }),
+            );
+        }
+        // An account emptied by execution must retain its original prestate.
+        for address in [funded_beneficiary, nonce_account, contract] {
+            state.insert(address, Account::default());
+        }
+
+        let builder = GethTraceBuilder::new(Vec::new());
+        for code_enabled in [false, true] {
+            let frame = builder.geth_prestate_pre_traces(&state, &db, code_enabled, false).unwrap();
+            assert_eq!(
+                frame,
+                PreStateFrame::Default(PreStateMode(BTreeMap::from([
+                    (funded_beneficiary, AccountState::from_account_info(0, U256::from(10), None)),
+                    (nonce_account, AccountState::from_account_info(1, U256::ZERO, None)),
+                    (
+                        contract,
+                        AccountState::from_account_info(
+                            0,
+                            U256::ZERO,
+                            code_enabled.then(|| code.original_bytes()),
+                        )
+                    ),
+                ]))),
+            );
         }
     }
 }
