@@ -170,7 +170,9 @@ impl<'a> GethTraceBuilder<'a> {
         let include_logs = opts.with_log.unwrap_or_default();
         // first fill up the root
         let main_trace_node = &self.nodes[0];
-        let mut root_call_frame = main_trace_node.geth_empty_call_frame(include_logs);
+        // like any other failed call, a failed root drops its own logs
+        let root_logs_visible = include_logs && !main_trace_node.trace.is_error();
+        let mut root_call_frame = main_trace_node.geth_empty_call_frame(root_logs_visible);
         root_call_frame.gas_used = U256::from(gas_used);
 
         if opts.only_top_call.unwrap_or_default() {
