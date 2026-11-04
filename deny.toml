@@ -2,12 +2,24 @@
 version = 2
 yanked = "warn"
 ignore = [
+    # crypto-bigint timing variability, patched in 0.7.6, but elliptic-curve 0.13 (k256) still
+    # requires 0.5.x, which has no fix. The advisory concerns operations on secret integers; k256
+    # is reached only through alloy-primitives, alloy-eip7702 and revm-precompile for signature
+    # recovery and ecrecover, which operate on public data.
+    # https://rustsec.org/advisories/RUSTSEC-2026-0387
+    "RUSTSEC-2026-0387",
     # https://rustsec.org/advisories/RUSTSEC-2024-0436
     "RUSTSEC-2024-0436",
+    # proc-macro-error2 is pulled in through alloy-sol-types; no safe upgrade is available yet.
+    # https://rustsec.org/advisories/RUSTSEC-2026-0173
+    "RUSTSEC-2026-0173",
 ]
 
 [bans]
 multiple-versions = "warn"
+# Mantle: relaxed because revm is taken from git while the revm 41 line is in
+# development, and a git dependency carries no version requirement, which this
+# lint counts as a wildcard. Restore to "deny" when revm goes back to a version.
 wildcards = "warn"
 highlight = "all"
 
@@ -47,4 +59,5 @@ license-files = [{ path = "LICENSE", hash = 0x001c7e6c }]
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
+# Mantle: revm is taken from this fork, not crates.io. See [dependencies] in Cargo.toml.
 allow-git = ["https://github.com/mantle-xyz/revm"]
