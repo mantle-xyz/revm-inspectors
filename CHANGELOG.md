@@ -5,6 +5,104 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.41.4](https://github.com/paradigmxyz/revm-inspectors/releases/tag/v0.41.4) - 2026-08-12
+
+### Bug Fixes
+
+- [tracing] Default unspecified CallFrame fields ([#480](https://github.com/paradigmxyz/revm-inspectors/issues/480))
+
+## [0.41.3](https://github.com/paradigmxyz/revm-inspectors/releases/tag/v0.41.3) - 2026-08-12
+
+### Bug Fixes
+
+- [tracing] Add defaults to trace literals ([#474](https://github.com/paradigmxyz/revm-inspectors/issues/474))
+
+### Miscellaneous Tasks
+
+- Release 0.41.3
+
+## [0.41.2](https://github.com/paradigmxyz/revm-inspectors/releases/tag/v0.41.2) - 2026-06-30
+
+### Miscellaneous Tasks
+
+- Release 0.41.2
+
+### Other
+
+- Revert "fix: pin time for boa engine" ([#464](https://github.com/paradigmxyz/revm-inspectors/issues/464))
+
+## [0.41.1](https://github.com/paradigmxyz/revm-inspectors/releases/tag/v0.41.1) - 2026-06-12
+
+### Bug Fixes
+
+- Pin time for boa engine ([#460](https://github.com/paradigmxyz/revm-inspectors/issues/460))
+
+### Miscellaneous Tasks
+
+- Release 0.41.1
+
+## [0.41.0](https://github.com/paradigmxyz/revm-inspectors/releases/tag/v0.41.0) - 2026-06-12
+
+### Dependencies
+
+- Bump revm to 41.0.0 ([#458](https://github.com/paradigmxyz/revm-inspectors/issues/458))
+
+### Miscellaneous Tasks
+
+- Release 0.41.0
+
+## [0.40.1](https://github.com/paradigmxyz/revm-inspectors/releases/tag/v0.40.1) - 2026-06-09
+
+### Bug Fixes
+
+- Record all stack snapshots in TracingInspectorConfig::all() ([#450](https://github.com/paradigmxyz/revm-inspectors/issues/450))
+- [erc7562] Enable state diffs to capture SLOAD in accessedSlots.reads ([#451](https://github.com/paradigmxyz/revm-inspectors/issues/451))
+
+### Miscellaneous Tasks
+
+- Release 0.40.1
+
+### Other
+
+- Optimize JS tracer callback object reuse ([#449](https://github.com/paradigmxyz/revm-inspectors/issues/449))
+- Allow proc-macro-error2 advisory ([#455](https://github.com/paradigmxyz/revm-inspectors/issues/455))
+- Use all stack snapshots in full tracing config ([#454](https://github.com/paradigmxyz/revm-inspectors/issues/454))
+
+## [0.40.0](https://github.com/paradigmxyz/revm-inspectors/releases/tag/v0.40.0) - 2026-05-21
+
+### Bug Fixes
+
+- [js] Add geth BigInteger.js polyfill compatibility shims ([#443](https://github.com/paradigmxyz/revm-inspectors/issues/443))
+- Validate JS tracer memory indexes ([#441](https://github.com/paradigmxyz/revm-inspectors/issues/441))
+- [js] Correct gas cost reporting ([#423](https://github.com/paradigmxyz/revm-inspectors/issues/423))
+- Construct JS tracer bigints directly ([#438](https://github.com/paradigmxyz/revm-inspectors/issues/438))
+- Show receive() instead of fallback() for empty calldata calls ([#394](https://github.com/paradigmxyz/revm-inspectors/issues/394))
+- Validate JS tracer stack indexes ([#439](https://github.com/paradigmxyz/revm-inspectors/issues/439))
+- Address clippy map iteration lint ([#440](https://github.com/paradigmxyz/revm-inspectors/issues/440))
+
+### Dependencies
+
+- [deps] Bump revm to 40.0.0 ([#445](https://github.com/paradigmxyz/revm-inspectors/issues/445))
+- [deps] Update snapbox requirement from 0.6 to 1.2 ([#428](https://github.com/paradigmxyz/revm-inspectors/issues/428))
+
+### Features
+
+- [TraceWriter] Order the storage writes in last-write order ([#388](https://github.com/paradigmxyz/revm-inspectors/issues/388))
+- Integrate Inspector frame_start/frame_end hooks ([#414](https://github.com/paradigmxyz/revm-inspectors/issues/414))
+
+### Miscellaneous Tasks
+
+- Release 0.40.0
+- Remove EdgeCovInspector (moved to foundry-rs/foundry) ([#436](https://github.com/paradigmxyz/revm-inspectors/issues/436))
+
+### Other
+
+- Harden supply chain (pin actions, restrict permissions, add dependabot) ([#426](https://github.com/paradigmxyz/revm-inspectors/issues/426))
+
+### Refactor
+
+- Relax `JsInspector` bounds ([#447](https://github.com/paradigmxyz/revm-inspectors/issues/447))
+
 ## [0.39.0](https://github.com/paradigmxyz/revm-inspectors/releases/tag/v0.39.0) - 2026-04-17
 
 ### Bug Fixes
@@ -15,6 +113,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Dependencies
 
 - Bump revm to 38.0.0 ([#427](https://github.com/paradigmxyz/revm-inspectors/issues/427))
+
+### Miscellaneous Tasks
+
+- Release 0.39.0
 
 ## [0.38.1](https://github.com/paradigmxyz/revm-inspectors/releases/tag/v0.38.1) - 2026-04-15
 
