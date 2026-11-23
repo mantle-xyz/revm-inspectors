@@ -2845,8 +2845,8 @@ mod tests {
             &[(outer, clear_then_call(0xf1, inner)), (inner, hex!("600060005500").to_vec())],
             outer,
         );
-        assert!(steps.contains(&"1:SSTORE:4800".to_string()), "{steps:?}");
-        assert!(steps.contains(&"2:SSTORE:9600".to_string()), "{steps:?}");
+        assert!(steps.iter().any(|s| s == "1:SSTORE:4800"), "{steps:?}");
+        assert!(steps.iter().any(|s| s == "2:SSTORE:9600"), "{steps:?}");
     }
 
     #[test]
@@ -2859,8 +2859,8 @@ mod tests {
             &[(outer, clear_then_call(0xf4, restorer)), (restorer, hex!("600160005500").to_vec())],
             outer,
         );
-        assert!(steps.contains(&"2:SSTORE:2800".to_string()), "{steps:?}");
-        assert!(steps.contains(&"2:STOP:2800".to_string()), "{steps:?}");
+        assert!(steps.iter().any(|s| s == "2:SSTORE:2800"), "{steps:?}");
+        assert!(steps.iter().any(|s| s == "2:STOP:2800"), "{steps:?}");
         assert_eq!(steps.last().unwrap(), "1:STOP:2800", "{steps:?}");
     }
 
