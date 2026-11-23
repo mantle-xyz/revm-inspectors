@@ -1,9 +1,8 @@
 [package]
 name = "revm-inspectors"
 description = "Revm inspector implementations"
-version = "0.41.4"
+version = "0.43.0"
 edition = "2021"
-# Mantle: 1.94 because alloy-*@2.4.x declares rust-version = "1.94.1".
 rust-version = "1.94"
 license = "MIT OR Apache-2.0"
 homepage = "https://github.com/paradigmxyz/revm-inspectors"
@@ -38,7 +37,8 @@ alloy-sol-types = { version = "1.4", default-features = false }
 alloy-primitives = { version = "1.4", default-features = false, features = [
     "map",
 ] }
-revm = { git = "https://github.com/mantle-xyz/revm", branch = "dev/mantle-v1.6.3", default-features = false }
+# [MANTLE] Mantle revm fork, pinned by tag; must match reth's revm source (D6).
+revm = { git = "https://github.com/mantle-xyz/revm", tag = "v119-mantle.1", default-features = false }
 
 anstyle = { version = "1.0", optional = true }
 colorchoice = "1.0"

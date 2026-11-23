@@ -14,7 +14,7 @@ use core::{borrow::Borrow, mem};
 use revm::{
     bytecode::opcode::{self, OpCode},
     context::{JournalTr, LocalContextTr},
-    context_interface::ContextTr,
+    context_interface::{Cfg, ContextTr},
     inspector::JournalExt,
     interpreter::{
         interpreter_types::{Immediates, Jumps, LoopControl, ReturnData, RuntimeFlag},
@@ -279,7 +279,11 @@ impl TracingInspector {
     /// Consumes the Inspector and returns a [GethTraceBuilder].
     #[inline]
     pub fn into_geth_builder(self) -> GethTraceBuilder<'static> {
-        GethTraceBuilder::new(self.traces.arena)
+        let builder = GethTraceBuilder::new(self.traces.arena);
+        match self.spec_id {
+            Some(spec_id) => builder.with_spec_id(spec_id),
+            None => builder,
+        }
     }
 
     /// Returns the  [GethTraceBuilder] for the recorded traces without consuming the type.
@@ -289,7 +293,11 @@ impl TracingInspector {
     /// starting a new transaction: [`Self::fuse`]
     #[inline]
     pub fn geth_builder(&self) -> GethTraceBuilder<'_> {
-        GethTraceBuilder::new_borrowed(&self.traces.arena)
+        let builder = GethTraceBuilder::new_borrowed(&self.traces.arena);
+        match self.spec_id {
+            Some(spec_id) => builder.with_spec_id(spec_id),
+            None => builder,
+        }
     }
 
     /// Returns true if we're no longer in the context of the root call.
@@ -531,6 +539,13 @@ impl TracingInspector {
             gas_refund_counter: interp.gas.refunded() as u64,
             gas_used,
             immediate_bytes,
+            state_gas_cost: None,
+            state_gas_reservoir: SpecId::is_enabled_in(
+                interp.runtime_flag.spec_id(),
+                SpecId::AMSTERDAM,
+            )
+            .then_some(interp.gas.reservoir()),
+            state_gas_spent: interp.gas.state_gas_spent(),
 
             // These fields will be populated in `step_end`.
             push_stack: None,
@@ -628,6 +643,10 @@ impl TracingInspector {
         // step the remaining gas here, at the end of the step.
         // TODO: Figure out why this can overflow. https://github.com/paradigmxyz/revm-inspectors/pull/38
         step.gas_cost = step.gas_remaining.saturating_sub(interp.gas.remaining());
+        let state_gas_delta = interp.gas.state_gas_spent().saturating_sub(step.state_gas_spent);
+        if step.state_gas_reservoir.is_some() && state_gas_delta != 0 {
+            step.state_gas_cost = Some(state_gas_delta);
+        }
 
         // set the status
         step.status = interp.bytecode.action().as_ref().and_then(|i| i.instruction_result())
@@ -639,6 +658,9 @@ where
     CTX: ContextTr<Journal: JournalExt>,
 {
     fn initialize_interp(&mut self, interp: &mut Interpreter, context: &mut CTX) {
+        if self.spec_id.is_none() {
+            self.spec_id = Some(interp.runtime_flag.spec_id());
+        }
         self.budget.check_and_halt(context, interp);
     }
 
@@ -678,6 +700,10 @@ where
     }
 
     fn call(&mut self, context: &mut CTX, inputs: &mut CallInputs) -> Option<CallOutcome> {
+        if self.spec_id.is_none() {
+            self.spec_id = Some(context.cfg().spec().into());
+        }
+
         // determine correct `from` and `to` based on the call scheme
         let (from, to) = match inputs.scheme {
             CallScheme::DelegateCall | CallScheme::CallCode => {
@@ -735,6 +761,10 @@ where
     }
 
     fn create(&mut self, context: &mut CTX, inputs: &mut CreateInputs) -> Option<CreateOutcome> {
+        if self.spec_id.is_none() {
+            self.spec_id = Some(context.cfg().spec().into());
+        }
+
         let nonce = context.journal_mut().load_account(inputs.caller()).ok()?.info.nonce;
         self.start_trace_on_call(
             context,
